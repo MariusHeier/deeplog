@@ -29,11 +29,11 @@ class Program
         ["39AE:400D"] = "MH4 Gamepad (Digital)",
         ["39AE:500A"] = "MH5 Gamepad (Analog)",
         ["39AE:500D"] = "MH5 Gamepad (Digital)",
-        ["054C:05C4"] = "MH4 Gamepad (Legacy)",
+        ["054C:05C4"] = "MH Gamepad (PS4 Mode)",
         ["1A86:1235"] = "MH-XSX / XInput v1.0",
         ["39AE:4000"] = "MH4 Gamepad (Setup Mode)",
         ["39AE:5000"] = "MH5 Gamepad (Setup Mode)",
-        ["1209:0001"] = "MH Gamepad (Setup Mode)",
+        ["1209:0001"] = "WebUSB Setup Device",
     };
 
     static readonly string[] SetupModeVidPids = { "39AE:4000", "39AE:5000", "1209:0001" };
@@ -97,11 +97,15 @@ class Program
         string ringEtl = Path.Combine(workDir, "ring.etl");
 
         // ── Phase 1: start BEFORE plug-in so enumeration is always captured ──
-        var present = DetectMHDevices();
-        if (present.Count > 0)
+        // Baseline of matching devices already present; anything in it is NOT
+        // treated as the controller being plugged in (a bench full of WebUSB
+        // dev hardware must not trigger false detections).
+        var baseline = DetectMHDevices();
+        var verifiedPresent = baseline.Where(d => d.Verified).ToList();
+        if (verifiedPresent.Count > 0)
         {
             Console.WriteLine("  ┌─────────────────────────────────────────────────────┐");
-            Console.WriteLine($"  │  {DeviceDisplayName(present[0]),-51} │");
+            Console.WriteLine($"  │  {verifiedPresent[0].Name,-51} │");
             Console.WriteLine("  │  is currently connected.                            │");
             Console.WriteLine("  │                                                     │");
             Console.WriteLine("  │  UNPLUG it now, then press ENTER.                   │");
@@ -125,18 +129,23 @@ class Program
         Console.WriteLine();
         Console.WriteLine("  Plug in your controller NOW. Waiting for it...");
 
-        string? detected = null;
+        // The controller is whatever shows up that wasn't there before -
+        // a newly arrived 1209:0001 counts even with a generic product
+        // string (older setup firmware), because it arrived on cue.
+        var baselineIds = new HashSet<string>(baseline.Select(d => d.VidPid));
+        (string VidPid, string Name, bool Verified) detected = default;
         for (int i = 0; i < 60; i++)
         {
             Thread.Sleep(1000);
             var now = DetectMHDevices();
-            if (now.Count > 0) { detected = now[0]; break; }
+            var hit = now.FirstOrDefault(d => d.Verified || !baselineIds.Contains(d.VidPid));
+            if (hit.VidPid != null) { detected = hit; break; }
         }
 
-        if (detected != null)
+        if (detected.VidPid != null)
         {
-            Console.WriteLine($"  Detected: {DeviceDisplayName(detected)}");
-            if (SetupModeVidPids.Contains(detected))
+            Console.WriteLine($"  Detected: {detected.Name}");
+            if (SetupModeVidPids.Contains(detected.VidPid))
             {
                 Console.WriteLine();
                 Console.WriteLine("  Note: the board is in setup mode. If your problem is");
@@ -165,7 +174,7 @@ class Program
         Console.WriteLine("  Press ENTER when the problem happens (or to stop).");
         Console.WriteLine();
 
-        var knownPresent = new HashSet<string>(DetectMHDevices());
+        var knownPresent = new HashSet<string>(DetectMHDevices().Select(d => d.VidPid));
         string trigger = "manual";
         DateTime? triggerTimeUtc = null;
         var sw = Stopwatch.StartNew();
@@ -189,7 +198,7 @@ class Program
             if (sw.Elapsed - lastPresenceCheck > TimeSpan.FromSeconds(2))
             {
                 lastPresenceCheck = sw.Elapsed;
-                var now = new HashSet<string>(DetectMHDevices());
+                var now = new HashSet<string>(DetectMHDevices().Select(d => d.VidPid));
                 var vanished = knownPresent.Where(d => !now.Contains(d)).ToList();
                 if (vanished.Count > 0)
                 {
@@ -566,7 +575,8 @@ class Program
         }
         snap["inputSoftware"] = inputSoftware;
 
-        snap["mhDevices"] = DetectMHDevices().Select(DeviceDisplayName).ToList();
+        snap["mhDevices"] = DetectMHDevices()
+            .Select(d => $"{d.VidPid} {d.Name}{(d.Verified ? "" : " (unverified)")}").ToList();
 
         return snap;
     }
@@ -613,13 +623,17 @@ class Program
         return false;
     }
 
-    static List<string> DetectMHDevices()
+    // 1209:0001 is the shared pid.codes test PID, so VID:PID alone cannot
+    // prove it is an MH board. The product string can: newer MH setup
+    // firmware reports "MH-..." names. Generic strings stay unverified so we
+    // never claim a random WebUSB device is an MH gamepad.
+    static List<(string VidPid, string Name, bool Verified)> DetectMHDevices()
     {
-        var found = new List<string>();
+        var found = new List<(string VidPid, string Name, bool Verified)>();
         try
         {
             using var searcher = new ManagementObjectSearcher(
-                "SELECT PNPDeviceID FROM Win32_PnPEntity WHERE " +
+                "SELECT Name, PNPDeviceID FROM Win32_PnPEntity WHERE " +
                 "PNPDeviceID LIKE 'USB\\\\VID_39AE%' OR PNPDeviceID LIKE 'USB\\\\VID_054C&PID_05C4%' OR " +
                 "PNPDeviceID LIKE 'USB\\\\VID_1A86&PID_1235%' OR PNPDeviceID LIKE 'USB\\\\VID_1209&PID_0001%'");
             foreach (var obj in searcher.Get())
@@ -628,7 +642,20 @@ class Program
                 var m = System.Text.RegularExpressions.Regex.Match(id, @"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})");
                 if (!m.Success) continue;
                 string vidPid = $"{m.Groups[1].Value.ToUpper()}:{m.Groups[2].Value.ToUpper()}";
-                if (!found.Contains(vidPid)) found.Add(vidPid);
+                if (found.Any(f => f.VidPid == vidPid)) continue;
+
+                if (vidPid == "1209:0001")
+                {
+                    string busName = obj["Name"]?.ToString() ?? "";
+                    if (busName.StartsWith("MH", StringComparison.OrdinalIgnoreCase))
+                        found.Add((vidPid, $"{busName} (Setup Mode)", true));
+                    else
+                        found.Add((vidPid, "WebUSB Setup Device", false));
+                }
+                else
+                {
+                    found.Add((vidPid, DeviceDisplayName(vidPid), true));
+                }
             }
         }
         catch { }
