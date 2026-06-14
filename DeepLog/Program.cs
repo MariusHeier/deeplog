@@ -12,7 +12,7 @@ using System.Threading;
 
 class Program
 {
-    const string VERSION = "1.0.0";
+    const string VERSION = "1.0.1";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -78,8 +78,8 @@ class Program
         PrintCentered($"USB Incident Logger  v{VERSION}", 60);
         PrintDoubleLine(60);
         Console.WriteLine();
-        Console.WriteLine("  Records USB activity to a ring buffer while you play,");
-        Console.WriteLine("  so the moment something goes wrong is always captured.");
+        Console.WriteLine("  Records USB activity to a debug log so it can be");
+        Console.WriteLine("  analyzed for problems.");
         Console.WriteLine();
 
         // Disk check: ring file + zip staging.
@@ -104,23 +104,24 @@ class Program
         var verifiedPresent = baseline.Where(d => d.Verified).ToList();
         if (verifiedPresent.Count > 0)
         {
-            Console.WriteLine("  ┌─────────────────────────────────────────────────────┐");
-            Console.WriteLine($"  │  {verifiedPresent[0].Name,-51} │");
-            Console.WriteLine("  │  is currently connected.                            │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  UNPLUG it now, then press ENTER.                   │");
-            Console.WriteLine("  │  (Logging must start before the controller plugs   │");
-            Console.WriteLine("  │   in, so the connection itself gets recorded.)      │");
-            Console.WriteLine("  └─────────────────────────────────────────────────────┘");
-            Console.ReadLine();
+            Console.WriteLine($"  {verifiedPresent[0].Name} is connected.");
+            Console.WriteLine();
+            Console.WriteLine("  UNPLUG it now to begin...");
+            // The connection itself has to land inside the trace, so wait for the
+            // device to actually leave the bus rather than trusting a keypress -
+            // pressing ENTER while it is still plugged in would miss the
+            // enumeration and silently record nothing useful.
+            var presentIds = new HashSet<string>(verifiedPresent.Select(d => d.VidPid));
+            while (DetectMHDevices().Any(d => presentIds.Contains(d.VidPid)))
+                Thread.Sleep(1000);
+            Console.WriteLine("  Unplugged.");
+            // Re-baseline after the unplug so the replug registers as a new arrival.
+            baseline = DetectMHDevices();
         }
         else
         {
-            Console.WriteLine("  ┌─────────────────────────────────────────────────────┐");
-            Console.WriteLine("  │  Keep your controller UNPLUGGED.                    │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  Press ENTER to start logging, then plug it in.     │");
-            Console.WriteLine("  └─────────────────────────────────────────────────────┘");
+            Console.WriteLine("  Keep your controller UNPLUGGED.");
+            Console.WriteLine("  Press ENTER to start logging, then plug it in.");
             Console.ReadLine();
         }
 
@@ -138,7 +139,7 @@ class Program
         {
             Thread.Sleep(1000);
             var now = DetectMHDevices();
-            var hit = now.FirstOrDefault(d => d.Verified || !baselineIds.Contains(d.VidPid));
+            var hit = now.FirstOrDefault(d => !baselineIds.Contains(d.VidPid));
             if (hit.VidPid != null) { detected = hit; break; }
         }
 
@@ -286,23 +287,21 @@ class Program
         while (true)
         {
             Console.WriteLine();
-            Console.WriteLine("  ┌─ What this sends to Marius ─────────────────────────┐");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  1. USB timing log (ring buffer + connection log)   │");
-            Console.WriteLine("  │     When USB transfers happened and how long they   │");
-            Console.WriteLine("  │     took - timing only. No data contents, no        │");
-            Console.WriteLine("  │     keystrokes, no files, no screen.                │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  2. Your answers from the questions above           │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  3. System snapshot: power settings, Windows        │");
-            Console.WriteLine("  │     version, USB controller + connected USB device  │");
-            Console.WriteLine("  │     models, driver versions, input software running │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  │  Not included: your name, Windows username, files,  │");
-            Console.WriteLine("  │  browsing, or anything you typed.                   │");
-            Console.WriteLine("  │                                                     │");
-            Console.WriteLine("  └─────────────────────────────────────────────────────┘");
+            Console.WriteLine("  What this sends to Marius:");
+            Console.WriteLine();
+            Console.WriteLine("    1. USB timing log (ring buffer + connection log)");
+            Console.WriteLine("       When USB transfers happened and how long they took");
+            Console.WriteLine("       - timing only. No data contents, no keystrokes,");
+            Console.WriteLine("       no files, no screen.");
+            Console.WriteLine();
+            Console.WriteLine("    2. Your answers from the questions above");
+            Console.WriteLine();
+            Console.WriteLine("    3. System snapshot: power settings, Windows version,");
+            Console.WriteLine("       USB controller + connected USB device models,");
+            Console.WriteLine("       driver versions, input software running");
+            Console.WriteLine();
+            Console.WriteLine("  Not included: your name, Windows username, files,");
+            Console.WriteLine("  browsing, or anything you typed.");
             Console.WriteLine();
             Console.WriteLine("    [1] Send to Marius");
             Console.WriteLine("    [2] Show me the full system snapshot first");
@@ -323,14 +322,12 @@ class Program
                 if (logId != null)
                 {
                     Console.WriteLine();
-                    Console.WriteLine($"  ┌─────────────────────────────────────────────────────┐");
-                    Console.WriteLine($"  │  Upload complete!                                    │");
-                    Console.WriteLine($"  │                                                     │");
-                    Console.WriteLine($"  │  Log ID: {logId,-43} │");
-                    Console.WriteLine($"  │                                                     │");
-                    Console.WriteLine($"  │  Send this ID to Marius on Discord:                 │");
-                    Console.WriteLine($"  │  {DiscordUrl,-51} │");
-                    Console.WriteLine($"  └─────────────────────────────────────────────────────┘");
+                    Console.WriteLine("  Upload complete!");
+                    Console.WriteLine();
+                    Console.WriteLine($"  Log ID: {logId}");
+                    Console.WriteLine();
+                    Console.WriteLine("  Send this ID to Marius on Discord:");
+                    Console.WriteLine($"  {DiscordUrl}");
                     try { Directory.Delete(workDir, true); } catch { }
                 }
                 else
@@ -380,13 +377,9 @@ class Program
     static string? UploadBundle(string workDir, string enumEtl, string ringEtl)
     {
         Console.WriteLine();
-        Console.Write("  Your nickname (Discord/name): ");
+        Console.Write("  Your nickname (Discord/name, ENTER for anonymous): ");
         string? nickname = Console.ReadLine()?.Trim();
-        if (string.IsNullOrEmpty(nickname))
-        {
-            Console.WriteLine("  Skipped - no nickname provided.");
-            return null;
-        }
+        if (string.IsNullOrEmpty(nickname)) nickname = "anonymous";
 
         Console.WriteLine();
         Console.WriteLine("  Compressing bundle...");
@@ -408,8 +401,18 @@ class Program
             return null;
         }
 
+        long enumSize = File.Exists(enumEtl) ? new FileInfo(enumEtl).Length : 0;
+        long ringSize = File.Exists(ringEtl) ? new FileInfo(ringEtl).Length : 0;
         long fileSize = new FileInfo(zipPath).Length;
-        Console.WriteLine($"  Bundle size: {fileSize / 1024 / 1024} MB");
+
+        Console.WriteLine();
+        Console.WriteLine("  Bundle contents:");
+        Console.WriteLine($"    enum.etl  (connection log)  {HumanSize(enumSize)}");
+        Console.WriteLine($"    ring.etl  (timing buffer)   {HumanSize(ringSize)}");
+        Console.WriteLine("    survey.json, snapshot.json");
+        Console.WriteLine($"    compressed to {HumanSize(fileSize)}");
+        if (enumSize == 0 && ringSize == 0)
+            Console.WriteLine("  Warning: no USB timing data was captured.");
 
         if (fileSize > 500L * 1024 * 1024)
         {
@@ -700,6 +703,11 @@ class Program
             return "";
         }
     }
+
+    static string HumanSize(long bytes) =>
+        bytes >= 1024L * 1024 ? $"{bytes / 1024.0 / 1024.0:F1} MB"
+        : bytes >= 1024 ? $"{bytes / 1024.0:F0} KB"
+        : $"{bytes} bytes";
 
     static void PrintDoubleLine(int width) => Console.WriteLine(new string('═', width));
 
