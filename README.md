@@ -39,8 +39,8 @@ something is wrong: two recordings to compare beats one.
 - PC load during the recording (CPU per core, DPC/interrupt time, memory,
   top 5 programs by CPU), sampled 4x per second on the same clock as the
   controller data
-- The controller's chip ID in PS4 mode (so its factory calibration can be
-  looked up), and a random ID DeepLog makes for this PC on first run
+- The controller's chip ID (so its factory calibration can be looked up),
+  and a random ID DeepLog makes for this PC on first run
 
 ## What gets sent (and what doesn't)
 

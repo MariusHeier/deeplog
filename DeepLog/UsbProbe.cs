@@ -79,9 +79,9 @@ static class UsbProbe
         {
             string id = DevNode.Id(c);
             if (!id.StartsWith(@"USB\", StringComparison.OrdinalIgnoreCase)) continue;   // HID/XUSB children etc.
-            bool iface = id.Contains("&MI_", StringComparison.OrdinalIgnoreCase);
-            string p = iface
-                ? $"{path}/if{Regex.Match(id, @"&MI_([0-9A-Fa-f]{2})").Groups[1].Value}"
+            var fn = Regex.Match(id, @"&(MI|IG)_([0-9A-Fa-f]{2})");
+            string p = fn.Success
+                ? $"{path}/{(fn.Groups[1].Value.ToUpperInvariant() == "MI" ? "if" : "ig")}{fn.Groups[2].Value}"
                 : $"{path}/p{DevNode.U32(c, DevNode.Address)?.ToString() ?? "?"}";
             var n = new Node { Dev = c, Id = id, Path = p, Controller = ci, HubDepth = depth };
             nodes.Add(n);
@@ -93,12 +93,18 @@ static class UsbProbe
 
     static Node? FindPad(List<Node> nodes, string? vidPid, out string how)
     {
-        var devs = nodes.Where(n => !n.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase)).ToList();
+        // Interfaces (&MI_) and the XInput HID child (&IG_) share the pad's VID:PID; skip them.
+        var devs = nodes.Where(n => !IsChildFunction(n.Id)).ToList();
         if (vidPid != null && vidPid != "OTHER")
         {
-            var hit = devs.Where(n => DevNode.VidPid(n.Id) == vidPid).ToList();
+            // Several can still match (two identical pads): prefer the one whose
+            // subtree carries the backend's driver, so the choice is deliberate.
+            string want = vidPid == "054C:05C4" ? "HidUsb" : "xusb22";
+            var hit = devs.Where(n => DevNode.VidPid(n.Id) == vidPid)
+                          .OrderByDescending(n => SubtreeServices(n.Dev, 2).Any(s => s.Equals(want, StringComparison.OrdinalIgnoreCase)))
+                          .ToList();
             how = hit.Count switch { 0 => $"{vidPid} not on the USB tree", 1 => $"by VID:PID {vidPid}",
-                _ => $"by VID:PID {vidPid} ({hit.Count} present, first taken)" };
+                _ => $"by VID:PID {vidPid} ({hit.Count} devices, the one with {want} taken)" };
             return hit.FirstOrDefault();
         }
         // Unknown XInput pad: the USB device whose subtree carries the XInput driver.
@@ -110,6 +116,9 @@ static class UsbProbe
             _ => $"by XInput driver ({xin.Count} candidates, first taken)" };
         return xin.FirstOrDefault();
     }
+
+    static bool IsChildFunction(string id) =>
+        id.Contains("&MI_", StringComparison.OrdinalIgnoreCase) || id.Contains("&IG_", StringComparison.OrdinalIgnoreCase);
 
     static IEnumerable<string> SubtreeServices(uint dev, int depth)
     {
@@ -155,7 +164,7 @@ static class UsbProbe
                               n.Path.StartsWith(hubPrefix + "/") && n.Path.Count(ch => ch == '/') == padPath.Count(ch => ch == '/'))
                           .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {DevNode.Name(n.Dev)}").ToList(),
             ["sameController"] = nodes.Where(n => n != pad && n.Path.StartsWith(ctrlPrefix) &&
-                              !n.Path.StartsWith(padPath + "/") && !n.Id.Contains("&MI_", StringComparison.OrdinalIgnoreCase))
+                              !n.Path.StartsWith(padPath + "/") && !IsChildFunction(n.Id))
                           .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {DevNode.Name(n.Dev)}").ToList(),
             ["deviceStack"] = StackTree(pad.Dev, 3),
         };

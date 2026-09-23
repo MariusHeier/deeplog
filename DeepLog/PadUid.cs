@@ -49,15 +49,26 @@ static class PadUid
         var res = new Dictionary<string, object?> { ["uid"] = null };
         if (vidPid != "054C:05C4")
         {
-            res["method"] = "none";
-            res["skipped"] = "XInput gaming mode exposes no UID command (GET_UID is only on the setup-mode WebUSB pipe, "
-                           + "and switching mode would interrupt the owner); not attempted";
-            // Some firmware may put a UID in the USB serial string; record it only if it has the UID's shape.
+            // XInput gaming mode has no GET_UID command (that is on the setup-mode
+            // WebUSB pipe), but MH XInput firmware reports the UID as the USB serial
+            // string, printed as three big-endian 32-bit words. The setup page and
+            // config backups use raw byte order (= GET_UID), so each word is
+            // byte-reversed: serial 886EAE24A6AB7019E339E339 -> uid 24AE6E881970ABA639E339E3
+            // (same board, verified against a setup-page backup 2026-09-23).
             string tail = padInstanceId?[(padInstanceId.LastIndexOf('\\') + 1)..] ?? "";
             if (System.Text.RegularExpressions.Regex.IsMatch(tail, "^[0-9A-Fa-f]{24}$"))
             {
-                res["uid"] = tail.ToUpperInvariant();
-                res["method"] = "usb-serial-string (24 hex, UID-shaped)";
+                string serial = tail.ToUpperInvariant();
+                res["uid"] = string.Concat(Enumerable.Range(0, 3).Select(w =>
+                    string.Concat(Enumerable.Range(0, 4).Select(b => serial.Substring(w * 8 + (3 - b) * 2, 2)))));
+                res["usbSerial"] = serial;
+                res["method"] = "usb-serial-string, word byte order reversed to setup-page format";
+            }
+            else
+            {
+                res["method"] = "none";
+                res["skipped"] = "no UID-shaped USB serial string, and XInput mode has no GET_UID command "
+                               + "(switching to setup mode would interrupt the owner)";
             }
             return res;
         }

@@ -19,7 +19,7 @@
 // v2.1 adds (all additive, older readers ignore them): a random per-user
 // installId, USB placement + the other USB devices + live driver stacks +
 // selective-suspend/D-state (UsbProbe.cs), driver service state, the pad UID
-// in PS4 mode (PadUid.cs), and machine load sampled during the recording
+// (PadUid.cs: PS4 feature report or XInput serial string), and machine load sampled during the recording
 // (LoadSampler.cs -> load.json). WMI is gone: everything is CfgMgr32, SCM,
 // registry and ntdll. --headless drives a real capture without prompts.
 
@@ -269,7 +269,7 @@ class Program
         Console.WriteLine("    system info (Windows version, USB + power settings)");
         Console.WriteLine("    which USB port/hub the controller is on, and the names of the other USB devices");
         Console.WriteLine("    PC load during the recording (CPU, memory, top 5 programs by CPU)");
-        Console.WriteLine("    the controller's chip ID (PS4 mode), and a random ID for this PC made by DeepLog");
+        Console.WriteLine("    the controller's chip ID, and a random ID for this PC made by DeepLog");
         Console.WriteLine();
         Console.WriteLine("  Nothing else is included.");
         Console.WriteLine();
