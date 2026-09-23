@@ -15,6 +15,13 @@
 // toolsmariusheiercom/S3-UPLOAD-PATTERN.md).
 //
 // No admin required (v1 needed it for ETW; v2 has no ETW).
+//
+// v2.1 adds (all additive, older readers ignore them): a random per-user
+// installId, USB placement + the other USB devices + live driver stacks +
+// selective-suspend/D-state (UsbProbe.cs), driver service state, the pad UID
+// in PS4 mode (PadUid.cs), and machine load sampled during the recording
+// (LoadSampler.cs -> load.json). WMI is gone: everything is CfgMgr32, SCM,
+// registry and ntdll. --headless drives a real capture without prompts.
 
 using System;
 using System.Collections.Generic;
@@ -22,7 +29,6 @@ using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
-using System.Management;
 using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -32,7 +38,7 @@ using Microsoft.Win32.SafeHandles;
 
 class Program
 {
-    const string VERSION = "2.0.0";
+    const string VERSION = "2.1.0";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -61,14 +67,45 @@ class Program
     static string DeviceDisplayName(string vidPid) =>
         KnownDevices.TryGetValue(vidPid, out var name) ? name : vidPid;
 
+    // --headless: no prompts, for bench testing. Records a real capture from the
+    // pad that is plugged in; never uploads unless --upload is given too.
+    static bool Headless;
+
+    // Relaxed escaping keeps '&' in instance IDs readable; the JSON is equivalent.
+    static readonly JsonSerializerOptions JsonOut = new()
+    { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    static readonly JsonSerializerOptions JsonCompact = new()
+    { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+    static string? ArgValue(string[] args, string name)
+    {
+        int i = Array.IndexOf(args, name);
+        return i >= 0 && i + 1 < args.Length ? args[i + 1] : null;
+    }
+
     static void Main(string[] args)
     {
         if (args.Contains("--snapshot"))
         {
-            Console.WriteLine(JsonSerializer.Serialize(CollectSnapshot(),
-                new JsonSerializerOptions { WriteIndented = true }));
+            string? pad = DetectMHDevices().FirstOrDefault(d => d.Verified).VidPid;
+            Console.WriteLine(JsonSerializer.Serialize(CollectSnapshot(UsbProbe.Collect(pad ?? "OTHER")),
+                JsonOut));
             return;
         }
+        if (ArgValue(args, "--probe-usb") is string probeVidPid)
+        {
+            // Bench check of the placement code against any present device (read-only).
+            var probe = UsbProbe.Collect(probeVidPid.ToUpperInvariant());
+            Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["padMatch"] = probe["padMatch"],
+                ["padPlacement"] = probe.GetValueOrDefault("padPlacement"),
+                ["padFiltersInStack"] = UsbProbe.ThirdPartyInStack(probe),
+            }, JsonOut));
+            return;
+        }
+        Headless = args.Contains("--headless");
+        double recordSeconds = double.TryParse(ArgValue(args, "--seconds"), System.Globalization.NumberStyles.Float,
+            System.Globalization.CultureInfo.InvariantCulture, out double sArg) && sArg > 0 && sArg <= 120 ? sArg : RecordSeconds;
 
         Console.WriteLine();
         Console.WriteLine("  D E E P L O G   v" + VERSION);
@@ -79,7 +116,7 @@ class Program
         Console.WriteLine();
 
         // ---- device selection ------------------------------------------------
-        var device = SelectDevice();
+        var device = Headless ? SelectDeviceHeadless(args.Contains("--allow-no-pad")) : SelectDevice();
         if (device == null) return;
         var (vidPid, name) = device.Value;
 
@@ -87,9 +124,14 @@ class Program
         int xinputSlot = -1;
         if (!ps4)
         {
-            xinputSlot = ResolveXInputSlot();
+            xinputSlot = vidPid == "NONE" ? 0 : ResolveXInputSlot();
             if (xinputSlot < 0) return;
         }
+
+        // Where the pad sits, while it is surely plugged in. Read-only, a few ms.
+        Dictionary<string, object?> usb;
+        try { usb = UsbProbe.Collect(vidPid); }
+        catch (Exception ex) { usb = new() { ["error"] = ex.Message }; }
 
         // ---- instruction + countdown ----------------------------------------
         Console.WriteLine();
@@ -97,9 +139,12 @@ class Program
         Console.WriteLine("    Move the joysticks in circles around the edge. Click buttons.");
         Console.WriteLine("    Whatever is relevant for your case.");
         Console.WriteLine();
+        string powerPlanBefore = ParseActivePowerPlan();
+        var load = new LoadSampler();
         Console.Write("  Starting in ");
         for (int i = (int)CountdownSeconds; i >= 1; i--)
         {
+            if (i == 1) load.Start();          // one second of pre-roll as a baseline
             Console.Write($"{i}...  ");
             Thread.Sleep(1000);
         }
@@ -110,15 +155,21 @@ class Program
         CaptureResult cap;
         try
         {
-            cap = ps4 ? HidCapture(0x054C, 0x05C4, RecordSeconds)
-                      : XInputCapture(xinputSlot, RecordSeconds);
+            cap = ps4 ? HidCapture(0x054C, 0x05C4, recordSeconds)
+                      : XInputCapture(xinputSlot, recordSeconds);
         }
         catch (Exception ex)
         {
+            load.Stop();
             Console.WriteLine();
             Console.WriteLine($"  Recording failed: {ex.Message}");
             return;
         }
+        load.Stop();
+        string powerPlanAfter = ParseActivePowerPlan();
+
+        // UID after the recording, so the capture itself is never disturbed.
+        var uid = PadUid.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, PadInstanceId(usb));
 
         Console.WriteLine();
         Console.WriteLine();
@@ -126,34 +177,46 @@ class Program
         Console.WriteLine();
 
         // ---- note + contact ----------------------------------------------------
-        Console.WriteLine("  Useful note to Marius");
-        Console.WriteLine("    example:  Log of normal joystick feeling");
-        Console.WriteLine("    example:  Log of joystick feeling weird");
-        Console.Write("  > ");
-        string note = (Console.ReadLine() ?? "").Trim();
-        if (note.Length == 0) note = "(no note)";
+        string note, nickname, email;
+        if (Headless)
+        {
+            note = ArgValue(args, "--note") ?? "(headless test capture)";
+            nickname = ArgValue(args, "--nickname") ?? "anonymous";
+            email = "";
+        }
+        else
+        {
+            Console.WriteLine("  Useful note to Marius");
+            Console.WriteLine("    example:  Log of normal joystick feeling");
+            Console.WriteLine("    example:  Log of joystick feeling weird");
+            Console.Write("  > ");
+            note = (Console.ReadLine() ?? "").Trim();
+            if (note.Length == 0) note = "(no note)";
 
-        Console.Write("  Your nickname (Discord/name, ENTER for anonymous): ");
-        string nickname = (Console.ReadLine() ?? "").Trim();
-        if (nickname.Length == 0) nickname = "anonymous";
+            Console.Write("  Your nickname (Discord/name, ENTER for anonymous): ");
+            nickname = (Console.ReadLine() ?? "").Trim();
+            if (nickname.Length == 0) nickname = "anonymous";
 
-        Console.Write("  Your email (optional, for follow-up -- ENTER to skip): ");
-        string email = (Console.ReadLine() ?? "").Trim();
+            Console.Write("  Your email (optional, for follow-up -- ENTER to skip): ");
+            email = (Console.ReadLine() ?? "").Trim();
+        }
 
         // ---- bundle ------------------------------------------------------------
         string workDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "DeepLog", $"deeplog_{DateTime.Now:yyyy-MM-dd_HHmm}");
+            "DeepLog", $"deeplog_{DateTime.Now:yyyy-MM-dd_HHmmss}");
         Directory.CreateDirectory(workDir);
 
         string mhcPath = Path.Combine(workDir, "data.mhc");
         WriteMhc(mhcPath, cap);
 
+        string installId = InstallId();
         var meta = new Dictionary<string, object?>
         {
             ["tool"] = "deeplog",
             ["toolVersion"] = VERSION,
             ["createdUtc"] = DateTime.UtcNow.ToString("o"),
+            ["installId"] = installId,
             ["note"] = note,
             ["nickname"] = nickname,
             ["email"] = email,
@@ -163,20 +226,28 @@ class Program
                 ["name"] = name,
                 ["backend"] = ps4 ? "hid-raw" : "xinput",
                 ["xinputSlot"] = ps4 ? null : xinputSlot,
+                ["uid"] = uid["uid"],
             },
-            ["recordSeconds"] = RecordSeconds,
+            ["padUid"] = uid,
+            ["recordSeconds"] = recordSeconds,
             ["samples"] = cap.Count,
             ["achievedHz"] = Math.Round(cap.AchievedHz, 1),
             ["events"] = cap.Events,
+            ["headless"] = Headless ? true : null,
             ["recordFormat"] = ps4
                 ? "u32 t_us, u32 seq, byte[64] raw input report (proto 1, 72 B/record)"
                 : "u32 t_us, u32 packet, i16 lx, i16 ly, i16 rx, i16 ry, u8 lt, u8 rt, u16 buttons, u8 phase, u8 connected, u16 pad (proto 0, 24 B/record)",
         };
-        var jsonOpts = new JsonSerializerOptions { WriteIndented = true };
+        var loadJson = load.ToJson(cap.T0Ticks);
+        loadJson["powerPlanBefore"] = powerPlanBefore;
+        loadJson["powerPlanAfter"] = powerPlanAfter;
+
+        var jsonOpts = JsonOut;
         File.WriteAllText(Path.Combine(workDir, "meta.json"), JsonSerializer.Serialize(meta, jsonOpts));
         File.WriteAllText(Path.Combine(workDir, "note.txt"), note + Environment.NewLine);
         File.WriteAllText(Path.Combine(workDir, "snapshot.json"),
-            JsonSerializer.Serialize(CollectSnapshot(), jsonOpts));
+            JsonSerializer.Serialize(CollectSnapshot(usb, installId), jsonOpts));
+        File.WriteAllText(Path.Combine(workDir, "load.json"), JsonSerializer.Serialize(loadJson, JsonCompact));
 
         string zipPath = Path.Combine(workDir, "bundle.zip");
         using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
@@ -185,19 +256,36 @@ class Program
             zip.CreateEntryFromFile(Path.Combine(workDir, "meta.json"), "meta.json");
             zip.CreateEntryFromFile(Path.Combine(workDir, "note.txt"), "note.txt");
             zip.CreateEntryFromFile(Path.Combine(workDir, "snapshot.json"), "snapshot.json");
+            zip.CreateEntryFromFile(Path.Combine(workDir, "load.json"), "load.json", CompressionLevel.Optimal);
         }
         double zipMb = new FileInfo(zipPath).Length / 1024.0 / 1024.0;
 
         // ---- review + consent ----------------------------------------------------
         Console.WriteLine();
         Console.WriteLine("  Ready to send:");
-        Console.WriteLine($"    30 second controller recording   ({zipMb:F1} MB)");
+        Console.WriteLine($"    {recordSeconds:0} second controller recording   ({zipMb:F1} MB)");
         Console.WriteLine("    your note");
         Console.WriteLine("    your contact (nickname / email, if you gave them)");
         Console.WriteLine("    system info (Windows version, USB + power settings)");
+        Console.WriteLine("    which USB port/hub the controller is on, and the names of the other USB devices");
+        Console.WriteLine("    PC load during the recording (CPU, memory, top 5 programs by CPU)");
+        Console.WriteLine("    the controller's chip ID (PS4 mode), and a random ID for this PC made by DeepLog");
         Console.WriteLine();
         Console.WriteLine("  Nothing else is included.");
         Console.WriteLine();
+
+        if (Headless)
+        {
+            if (args.Contains("--upload"))
+            {
+                string? id = Upload(zipPath, nickname);
+                Console.WriteLine(id != null ? $"  Sent!  Log ID: {id}" : "  Upload failed.");
+            }
+            Console.WriteLine($"  Bundle: {zipPath}");
+            Console.WriteLine();
+            return;
+        }
+
         Console.Write("  Send to Marius now? [Y/n] ");
         string yn = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
 
@@ -290,6 +378,61 @@ class Program
         }
     }
 
+    /// No prompts: a verified gaming-mode MH pad, else any XInput pad. With
+    /// --allow-no-pad and nothing plugged in, records slot 0 anyway ("NONE") so
+    /// the rest of the pipeline can be exercised; the bundle says so.
+    static (string VidPid, string Name)? SelectDeviceHeadless(bool allowNoPad)
+    {
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (true)
+        {
+            var gaming = DetectMHDevices().Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid)).ToList();
+            if (gaming.Count > 0)
+            {
+                Console.WriteLine($"  Found: {gaming[0].Name}");
+                return (gaming[0].VidPid, gaming[0].Name);
+            }
+            if (ConnectedXInputSlots().Count > 0)
+            {
+                Console.WriteLine("  Found: USB controller (XInput)");
+                return ("OTHER", "Other USB controller");
+            }
+            if (DateTime.UtcNow > deadline) break;
+            Thread.Sleep(500);
+        }
+        if (!allowNoPad)
+        {
+            Console.WriteLine("  No controller found (headless). Plug one in, or pass --allow-no-pad.");
+            return null;
+        }
+        Console.WriteLine("  No controller connected -- recording XInput slot 0 anyway (--allow-no-pad).");
+        return ("NONE", "No controller connected (headless --allow-no-pad)");
+    }
+
+    static string? PadInstanceId(Dictionary<string, object?> usb) => UsbProbe.LastPadInstanceId;
+
+    /// Random per-user id, made on first run and kept in %LOCALAPPDATA%\DeepLog,
+    /// so repeat bundles from one PC can be linked. Not derived from MachineGuid
+    /// or any hardware serial.
+    static string InstallId()
+    {
+        try
+        {
+            string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeepLog");
+            string file = Path.Combine(dir, "install_id.txt");
+            if (File.Exists(file))
+            {
+                string existing = File.ReadAllText(file).Trim();
+                if (System.Text.RegularExpressions.Regex.IsMatch(existing, "^[0-9a-f]{16}$")) return existing;
+            }
+            Directory.CreateDirectory(dir);
+            string id = Convert.ToHexString(System.Security.Cryptography.RandomNumberGenerator.GetBytes(8)).ToLowerInvariant();
+            File.WriteAllText(file, id);
+            return id;
+        }
+        catch { return "unavailable"; }
+    }
+
     static int ResolveXInputSlot()
     {
         var deadline = DateTime.UtcNow.AddSeconds(15);
@@ -334,6 +477,7 @@ class Program
         public int Count;
         public double AchievedHz;
         public long StartUnixUs;
+        public long T0Ticks;               // QPC at t_us = 0, for aligning load.json
         public List<Dictionary<string, object>> Events = new();
     }
 
@@ -376,6 +520,7 @@ class Program
         try
         {
             var sw = Stopwatch.StartNew();
+            res.T0Ticks = Stopwatch.GetTimestamp() - sw.ElapsedTicks;
             long periodTicks = (long)(Stopwatch.Frequency / XInputTargetHz);
             long nextTick = sw.ElapsedTicks;
             long endTicks = (long)(seconds * Stopwatch.Frequency);
@@ -569,6 +714,7 @@ class Program
         };
 
         var sw = Stopwatch.StartNew();
+        res.T0Ticks = Stopwatch.GetTimestamp() - sw.ElapsedTicks;
         int n = 0;
         uint seq = 0;
         object gate = new();
@@ -710,28 +856,26 @@ class Program
         }
     }
 
-    // ---- device detection (WMI; same as v1 / DeepPoll) ---------------------------
+    // ---- device detection (CfgMgr32; v2.0 used WMI Win32_PnPEntity) ------------
+
+    static readonly string[] MhIdPrefixes = { @"USB\VID_39AE", @"USB\VID_054C&PID_05C4",
+        @"USB\VID_1A86&PID_1235", @"USB\VID_1209&PID_0001" };
 
     static List<(string VidPid, string Name, bool Verified)> DetectMHDevices()
     {
         var found = new List<(string VidPid, string Name, bool Verified)>();
         try
         {
-            using var searcher = new ManagementObjectSearcher(
-                "SELECT Name, PNPDeviceID FROM Win32_PnPEntity WHERE " +
-                "PNPDeviceID LIKE 'USB\\\\VID_39AE%' OR PNPDeviceID LIKE 'USB\\\\VID_054C&PID_05C4%' OR " +
-                "PNPDeviceID LIKE 'USB\\\\VID_1A86&PID_1235%' OR PNPDeviceID LIKE 'USB\\\\VID_1209&PID_0001%'");
-            foreach (var obj in searcher.Get())
+            foreach (var id in DevNode.PresentUsb())
             {
-                string id = obj["PNPDeviceID"]?.ToString() ?? "";
-                var m = System.Text.RegularExpressions.Regex.Match(id, @"VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})");
-                if (!m.Success) continue;
-                string vidPid = $"{m.Groups[1].Value.ToUpper()}:{m.Groups[2].Value.ToUpper()}";
-                if (found.Any(f => f.VidPid == vidPid)) continue;
+                if (!MhIdPrefixes.Any(p => id.StartsWith(p, StringComparison.OrdinalIgnoreCase))) continue;
+                string? vidPid = DevNode.VidPid(id);
+                if (vidPid == null || found.Any(f => f.VidPid == vidPid)) continue;
 
                 if (vidPid == "1209:0001")
                 {
-                    string busName = obj["Name"]?.ToString() ?? "";
+                    // Win32_PnPEntity.Name was FriendlyName, else DeviceDesc.
+                    string busName = DevNode.Name(DevNode.Locate(id));
                     if (busName.StartsWith("MH", StringComparison.OrdinalIgnoreCase))
                         found.Add((vidPid, $"{busName} (Setup Mode)", true));
                     else
@@ -747,34 +891,37 @@ class Program
         return found;
     }
 
-    // ---- system snapshot (carried over from v1) -----------------------------------
+    // ---- system snapshot -----------------------------------------------------------
 
-    static Dictionary<string, object> CollectSnapshot()
+    static string? RegStr(string key, string value)
+    {
+        try { return Microsoft.Win32.Registry.GetValue(key, value, null)?.ToString()?.Trim(); }
+        catch { return null; }
+    }
+
+    static Dictionary<string, object> CollectSnapshot(Dictionary<string, object?>? usb = null, string? installId = null)
     {
         var snap = new Dictionary<string, object>
         {
             ["collectedUtc"] = DateTime.UtcNow.ToString("o"),
             ["deeplogVersion"] = VERSION,
         };
+        if (installId != null) snap["installId"] = installId;
 
-        try
+        // Same shapes as the v2.0 WMI fields, from the registry. ProductName stays
+        // "Windows 10" on Windows 11, so the build number decides.
+        const string nt = @"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+        string? product = RegStr(nt, "ProductName"), build = RegStr(nt, "CurrentBuildNumber") ?? RegStr(nt, "CurrentBuild");
+        if (product != null)
         {
-            using var s = new ManagementObjectSearcher("SELECT Caption, BuildNumber FROM Win32_OperatingSystem");
-            foreach (var o in s.Get()) { snap["windows"] = $"{o["Caption"]} (build {o["BuildNumber"]})"; break; }
+            if (int.TryParse(build, out int b) && b >= 22000) product = product.Replace("Windows 10", "Windows 11");
+            snap["windows"] = $"Microsoft {product} (build {build})";
         }
-        catch { }
-        try
-        {
-            using var s = new ManagementObjectSearcher("SELECT Name FROM Win32_Processor");
-            foreach (var o in s.Get()) { snap["cpu"] = o["Name"]?.ToString()?.Trim() ?? ""; break; }
-        }
-        catch { }
-        try
-        {
-            using var s = new ManagementObjectSearcher("SELECT Manufacturer, Product FROM Win32_BaseBoard");
-            foreach (var o in s.Get()) { snap["motherboard"] = $"{o["Manufacturer"]} {o["Product"]}"; break; }
-        }
-        catch { }
+        if (RegStr(@"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString") is string cpu)
+            snap["cpu"] = cpu;
+        const string bios = @"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\BIOS";
+        if (RegStr(bios, "BaseBoardManufacturer") is string mbm)
+            snap["motherboard"] = $"{mbm} {RegStr(bios, "BaseBoardProduct")}";
 
         snap["powerPlan"] = ParseActivePowerPlan();
         snap["usbSelectiveSuspend"] = ParseSelectiveSuspend();
@@ -783,10 +930,8 @@ class Program
         var controllers = new List<string>();
         try
         {
-            using var s = new ManagementObjectSearcher(
-                "SELECT Name, DeviceID FROM Win32_PnPEntity WHERE Service='USBXHCI'");
-            foreach (var o in s.Get())
-                controllers.Add($"{o["Name"]} [{o["DeviceID"]}]");
+            foreach (var id in DevNode.List("USBXHCI", DevNode.CM_GETIDLIST_FILTER_SERVICE | DevNode.CM_GETIDLIST_FILTER_PRESENT))
+                controllers.Add($"{DevNode.Name(DevNode.Locate(id))} [{id}]");
         }
         catch { }
         snap["usbControllers"] = controllers;
@@ -825,11 +970,21 @@ class Program
             }
             catch { }
         }
-        snap["inputSoftware"] = inputSoftware;
+        snap["inputSoftware"] = inputSoftware;   // v2.0 field, kept as-is for older readers
+
+        // v2.1: installed is not running. Live service state from the SCM...
+        try { snap["driverServices"] = UsbProbe.Services("ViGEmBus", "HidHide", "USBPcap", "xusb22"); }
+        catch (Exception ex) { snap["driverServices"] = ex.Message; }
 
         snap["mhDevices"] = DetectMHDevices()
             .Select(d => $"{d.VidPid} {d.Name}{(d.Verified ? "" : " (unverified)")}").ToList();
 
+        // ...and which of them sit in the pad's own device stack right now.
+        if (usb != null)
+        {
+            try { snap["padFiltersInStack"] = UsbProbe.ThirdPartyInStack(usb); } catch { }
+            snap["usb"] = usb;
+        }
         return snap;
     }
 

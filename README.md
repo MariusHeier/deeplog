@@ -31,11 +31,24 @@ something is wrong: two recordings to compare beats one.
 - A system snapshot of the things that make USB flaky: power plan, USB
   selective suspend, fast startup, USB controllers, driver versions,
   controller-related software running
+- Where the controller is plugged in: which USB controller (CPU-direct,
+  chipset or add-in), how many hubs in between, what else shares that
+  controller and hub, the drivers actually loaded on the controller, and its
+  per-device power / selective-suspend state
+- Whether ViGEmBus, HidHide and USBPcap are running, not just installed
+- PC load during the recording (CPU per core, DPC/interrupt time, memory,
+  top 5 programs by CPU), sampled 4x per second on the same clock as the
+  controller data
+- The controller's chip ID in PS4 mode (so its factory calibration can be
+  looked up), and a random ID DeepLog makes for this PC on first run
 
 ## What gets sent (and what doesn't)
 
 Sent: the 30-second controller recording, your note, your nickname/email
-if you chose to give them, and the system snapshot.
+if you chose to give them, the system snapshot, and the PC load recording.
+USB device serial numbers are masked. The PC ID is random (kept in
+`%LOCALAPPDATA%\DeepLog\install_id.txt`); it is not derived from any
+hardware or Windows ID.
 
 Not sent: your Windows username, files, keystrokes, browsing, or anything
 you typed outside the tool. The review screen lists the full contents
@@ -45,7 +58,11 @@ before upload, and declining keeps the recording on your PC (under
 ## Data format
 
 Each bundle (zip) contains `data.mhc` (binary), `meta.json`, `note.txt`,
-and `snapshot.json`. The `.mhc` layout: 32-byte header (`MHC1`, version,
+`snapshot.json`, and (v2.1+) `load.json`. v2.1 only adds fields and files:
+`meta.installId`, `meta.padUid`, `meta.device.uid`; `snapshot.installId`,
+`snapshot.driverServices`, `snapshot.padFiltersInStack`, `snapshot.usb`
+(`usbHostControllers`, `usbDevices`, `padPlacement`); `load.json` rows are
+keyed by `t_us`, the same clock as the `.mhc` records. The `.mhc` layout: 32-byte header (`MHC1`, version,
 proto, record count, unix start time in us, record size), then fixed-size
 little-endian records:
 
@@ -53,10 +70,19 @@ little-endian records:
   i16 ry, u8 lt, u8 rt, u16 buttons, u8 phase, u8 connected, u16 pad`
 - proto 1 (PS4 raw HID, 72 B): `u32 t_us, u32 seq, byte[64] raw report`
 
+## Bench flags
+
+- `--snapshot` prints the system snapshot (no recording)
+- `--headless [--seconds N] [--note TEXT] [--allow-no-pad] [--upload]`
+  records without prompts; never uploads unless `--upload` is given
+- `--probe-usb VID:PID` prints the placement/stack/power probe for any
+  present USB device (read-only)
+
 ## Requirements
 
 - Windows 10/11
-- No admin needed (v1 required it for ETW tracing; v2 has no ETW)
+- No admin needed (v1 required it for ETW tracing; v2 has no ETW), and no
+  WMI (v2.1 reads the device tree through CfgMgr32)
 - An MH controller, or any XInput gamepad
 
 ## Building from Source
