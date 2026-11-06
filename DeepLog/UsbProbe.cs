@@ -167,7 +167,38 @@ static class UsbProbe
                               !n.Path.StartsWith(padPath + "/") && !IsChildFunction(n.Id))
                           .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {DevNode.Name(n.Dev)}").ToList(),
             ["deviceStack"] = StackTree(pad.Dev, 3),
+            ["driverPath"] = DriverPathNodes(pad.Dev, 3),
         };
+    }
+
+    /// Every devnode the pad's data passes through, each with its live stack: the pad and what hangs off it,
+    /// then the hubs, the root hub and the host controller. DriverIdentity decides whose each driver is.
+    public static List<Dictionary<string, object?>> DriverPathNodes(uint pad, int depth)
+    {
+        var list = new List<Dictionary<string, object?>>();
+        void Add(uint d, string where) => list.Add(new Dictionary<string, object?>
+        {
+            ["where"] = where,
+            ["instanceId"] = MaskSerial(DevNode.Id(d)),
+            ["service"] = DevNode.Str(d, DevNode.Service),
+            ["stack"] = DevNode.StrList(d, DevNode.Stack),
+            ["driverProvider"] = DevNode.Str(d, DevNode.DriverProvider),
+            ["driverInf"] = DevNode.Str(d, DevNode.DriverInfPath),
+        });
+        void Down(uint d, int left)
+        {
+            if (left == 0) return;
+            foreach (uint c in DevNode.Children(d)) { Add(c, "below pad"); Down(c, left - 1); }
+        }
+        Add(pad, "pad");
+        Down(pad, depth);
+        for (uint p = DevNode.Parent(pad); p != 0; p = DevNode.Parent(p))
+        {
+            string id = DevNode.Id(p);
+            if (!id.StartsWith(@"USB\", StringComparison.OrdinalIgnoreCase)) { Add(p, "host controller"); break; }
+            Add(p, id.StartsWith(@"USB\ROOT_HUB", StringComparison.OrdinalIgnoreCase) ? "root hub" : "hub");
+        }
+        return list;
     }
 
     // ---- power: D-state + per-device selective-suspend flags -------------------
@@ -209,17 +240,13 @@ static class UsbProbe
         return list;
     }
 
-    /// Filter/remapper drivers found anywhere in the pad's live stack.
-    public static List<string> ThirdPartyInStack(Dictionary<string, object?> usb)
+    /// snapshot.padDriverPath for what Collect found. The slow part, so it runs after the recording.
+    public static Dictionary<string, object?> DriverReport(Dictionary<string, object?> usb)
     {
-        var found = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-        if (usb.GetValueOrDefault("padPlacement") is Dictionary<string, object?> pl &&
-            pl["deviceStack"] is List<Dictionary<string, object?>> st)
-            foreach (var n in st)
-                foreach (var s in (List<string>)n["stack"]! )
-                    if (Regex.IsMatch(s, "HidHide|ViGEm|USBPcap|reWASD|nefcon|Wireshark|vjoy|ds4", RegexOptions.IgnoreCase))
-                        found.Add(s);
-        return found.ToList();
+        // A failed Collect is not "no pad": the caller reports it as an error.
+        if (usb.GetValueOrDefault("error") is string error) throw new InvalidOperationException(error);
+        return DriverIdentity.PathReport((usb.GetValueOrDefault("padPlacement") as Dictionary<string, object?>)?
+            .GetValueOrDefault("driverPath") as List<Dictionary<string, object?>>);
     }
 
     // ---- host controllers: CPU-direct vs chipset --------------------------------
@@ -367,11 +394,12 @@ static class UsbProbe
                         {
                             if (QueryServiceConfigW(s, buf, need, out _))
                             {
+                                info["kernelDriver"] = (Marshal.ReadInt32(buf, 0) & 0x3) != 0;   // SERVICE_KERNEL_DRIVER | SERVICE_FILE_SYSTEM_DRIVER
                                 uint start = (uint)Marshal.ReadInt32(buf, 4);
                                 info["startType"] = start < StartNames.Length ? StartNames[start] : start.ToString();
                                 string? bin = Marshal.PtrToStringUni(Marshal.ReadIntPtr(buf, 16));
                                 info["binary"] = bin;
-                                string? ver = DriverFileVersion(bin);
+                                string? ver = DriverFileVersion(bin, n);
                                 if (ver != null) info["fileVersion"] = ver;
                             }
                         }
@@ -386,17 +414,25 @@ static class UsbProbe
         return res;
     }
 
-    static string? DriverFileVersion(string? bin)
+    static string? DriverFileVersion(string? bin, string service)
     {
-        if (string.IsNullOrEmpty(bin)) return null;
-        string p = bin.Trim('"');
-        if (p.StartsWith(@"\SystemRoot\", StringComparison.OrdinalIgnoreCase))
-            p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), p[12..]);
-        else if (p.StartsWith(@"System32\", StringComparison.OrdinalIgnoreCase))
-            p = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), p);
-        else if (p.StartsWith(@"\??\")) p = p[4..];
-        try { return File.Exists(p) ? System.Diagnostics.FileVersionInfo.GetVersionInfo(p).FileVersion : null; }
+        string? p = BinaryFilePath(bin, service);
+        try { return p != null && File.Exists(p) ? System.Diagnostics.FileVersionInfo.GetVersionInfo(p).FileVersion : null; }
         catch { return null; }
+    }
+
+    /// The real path behind a driver service's ImagePath. A driver with none loads from System32\drivers.
+    public static string? BinaryFilePath(string? bin, string service)
+    {
+        string win = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        if (string.IsNullOrWhiteSpace(bin)) return Path.Combine(win, "System32", "drivers", service + ".sys");
+        string p = bin.Trim().Trim('"');
+        if (p.StartsWith(@"\SystemRoot\", StringComparison.OrdinalIgnoreCase)) return Path.Combine(win, p[12..]);
+        if (p.StartsWith(@"%SystemRoot%\", StringComparison.OrdinalIgnoreCase)) return Path.Combine(win, p[13..]);
+        if (p.StartsWith(@"System32\", StringComparison.OrdinalIgnoreCase)) return Path.Combine(win, p);
+        if (p.StartsWith(@"\??\")) return p[4..];
+        if (p.StartsWith(@"\Windows\", StringComparison.OrdinalIgnoreCase)) return Path.Combine(win, p[9..]);
+        return Path.IsPathFullyQualified(p) ? p : null;
     }
 
     // ---- helpers -----------------------------------------------------------------

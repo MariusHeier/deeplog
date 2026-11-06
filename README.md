@@ -36,6 +36,10 @@ something is wrong: two recordings to compare beats one.
   controller and hub, the drivers actually loaded on the controller, and its
   per-device power / selective-suspend state
 - Whether ViGEmBus, HidHide and USBPcap are running, not just installed
+- Every driver loaded on the controller's USB path (the controller, its hubs,
+  its USB port), with who made and signed each one, so that non-Microsoft
+  drivers can be told from Windows' own. Being on this list only means the
+  driver was loaded there, not that it causes a problem
 - PC load during the recording (CPU per core, DPC/interrupt time, memory,
   top 5 programs by CPU), sampled 4x per second on the same clock as the
   controller data
@@ -48,7 +52,10 @@ Sent: the 30-second controller recording, your note, your nickname/email
 if you chose to give them, the system snapshot, and the PC load recording.
 USB device serial numbers are masked. The PC ID is random (kept in
 `%LOCALAPPDATA%\DeepLog\install_id.txt`); it is not derived from any
-hardware or Windows ID.
+hardware or Windows ID. A driver file outside the Windows folder is sent as its
+file name only, and your Windows username and PC name are removed from what is
+reported about each driver. The driver check reads files already on your PC and
+uses no network.
 
 Not sent: your Windows username, files, keystrokes, browsing, or anything
 you typed outside the tool. The review screen lists the full contents
@@ -62,7 +69,34 @@ Each bundle (zip) contains `data.mhc` (binary), `meta.json`, `note.txt`,
 `meta.installId`, `meta.padUid`, `meta.device.uid`; `snapshot.installId`,
 `snapshot.driverServices`, `snapshot.padFiltersInStack`, `snapshot.usb`
 (`usbHostControllers`, `usbDevices`, `padPlacement`); `load.json` rows are
-keyed by `t_us`, the same clock as the `.mhc` records. The `.mhc` layout: 32-byte header (`MHC1`, version,
+keyed by `t_us`, the same clock as the `.mhc` records.
+
+v2.2 adds `snapshot.padDriverPath`, and `usb.padPlacement.driverPath` with the
+live stack of each device on the path:
+
+- `status`: `complete` (every driver decided, every stack read), `incomplete`
+  (see `couldNotTell` and `nodesWithNoStack`), `no-pad` or `error`. Only
+  `complete` means nothing is unknown.
+- `summary`: one plain sentence.
+- `notMicrosoft`, `couldNotTell`, `microsoft`: stack entries such as
+  `\Driver\HidHide`. Each driver is in exactly one.
+- `drivers`: per driver, `verdict`, `why`, `seenOn`, `signatures`, `file`,
+  `serviceState`, and `fileSays` (what the file claims about itself).
+- `otherDriverPackages`: driver packages not from Windows' own set. These can
+  bind a Microsoft file (Zadig's WinUSB) or a user-mode driver, which the stack
+  shows only as Microsoft's `WUDFRd`.
+
+`microsoft` needs proof: a signature Windows accepts, from a signer Microsoft
+uses for its own files, on a chain Windows says ends at a Microsoft root. The
+"Microsoft Windows Hardware Compatibility Publisher" signature does not count,
+because it also signs other companies' drivers.
+
+`padFiltersInStack` keeps its v2.1 shape and scope (the pad and what hangs off
+it), but from v2.2 it holds everything there not proved Microsoft's, instead of
+matches against a fixed list of names. It is left out when no list could be made
+(no pad, or the check failed), so never read a missing field as clean.
+
+The `.mhc` layout: 32-byte header (`MHC1`, version,
 proto, record count, unix start time in us, record size), then fixed-size
 little-endian records:
 
@@ -75,8 +109,13 @@ little-endian records:
 - `--snapshot` prints the system snapshot (no recording)
 - `--headless [--seconds N] [--note TEXT] [--allow-no-pad] [--upload]`
   records without prompts; never uploads unless `--upload` is given
-- `--probe-usb VID:PID` prints the placement/stack/power probe for any
-  present USB device (read-only)
+- `--probe-usb VID:PID` prints the placement/stack/power probe and the driver
+  report for any present USB device (read-only)
+- `--identify-driver NAME|FILE ...` prints the verdict for driver services or
+  files; `--identify-driver all` covers every kernel driver service
+- `--replay-stacks FILE` runs the driver report on stored stacks
+  (`[{"id": "...", "stacks": [["\\Driver\\x", ...], ...]}, ...]`). Files are
+  looked up on this PC, so a driver not installed here comes out could-not-tell
 
 ## Requirements
 

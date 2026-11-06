@@ -40,7 +40,9 @@ static class DevNode
         Manufacturer = K(DEV, 13), FriendlyName = K(DEV, 14), LocationInfo = K(DEV, 15),
         UpperFilters = K(DEV, 19), LowerFilters = K(DEV, 20), BusNumber = K(DEV, 23),
         Address = K(DEV, 30), PowerData = K(DEV, 32), LocationPaths = K(DEV, 37),
-        BusReportedDeviceDesc = K(DEV2, 4), Stack = K(DEV2, 14);
+        BusReportedDeviceDesc = K(DEV2, 4), Stack = K(DEV2, 14),
+        DriverInfPath = K("a8b865dd-2e3d-4094-ad97-e593a70c75d6", 5),
+        DriverProvider = K("a8b865dd-2e3d-4094-ad97-e593a70c75d6", 9);
 
     /// Instance IDs of present devices, optionally filtered by enumerator ("USB") or service.
     public static List<string> List(string? filter, uint flags)

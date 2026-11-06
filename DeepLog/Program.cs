@@ -22,6 +22,11 @@
 // (PadUid.cs: PS4 feature report or XInput serial string), and machine load sampled during the recording
 // (LoadSampler.cs -> load.json). WMI is gone: everything is CfgMgr32, SCM,
 // registry and ntdll. --headless drives a real capture without prompts.
+//
+// v2.2 adds snapshot.padDriverPath: every driver on the pad's USB path and whose
+// it is, from the file's signature (DriverIdentity.cs). padFiltersInStack keeps
+// its shape but is no longer a fixed list of names: it is everything in the pad's
+// stack not proved Microsoft's, and is left out when no list could be made.
 
 using System;
 using System.Collections.Generic;
@@ -38,7 +43,7 @@ using Microsoft.Win32.SafeHandles;
 
 class Program
 {
-    const string VERSION = "2.1.0";
+    const string VERSION = "2.2.0";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -95,12 +100,56 @@ class Program
         {
             // Bench check of the placement code against any present device (read-only).
             var probe = UsbProbe.Collect(probeVidPid.ToUpperInvariant());
+            var report = UsbProbe.DriverReport(probe);
             Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
             {
                 ["padMatch"] = probe["padMatch"],
                 ["padPlacement"] = probe.GetValueOrDefault("padPlacement"),
-                ["padFiltersInStack"] = UsbProbe.ThirdPartyInStack(probe),
+                ["padFiltersInStack"] = DriverIdentity.OldFilterField(report),
+                ["padDriverPath"] = report,
             }, JsonOut));
+            return;
+        }
+        if (ArgValue(args, "--identify-driver") is string _)
+        {
+            // Bench check of the verdict: service names or file paths, or "all" for every kernel driver service.
+            var names = args.SkipWhile(a => a != "--identify-driver").Skip(1).ToList();
+            if (names.SequenceEqual(new[] { "all" }))
+                using (var services = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services")!)
+                    names = services.GetSubKeyNames().Where(n =>
+                    {
+                        using var k = services.OpenSubKey(n);
+                        return k?.GetValue("Type") is int t && (t & 0x3) != 0;
+                    }).ToList();
+            Console.WriteLine(JsonSerializer.Serialize(names.Select(DriverIdentity.Identify).ToList(), JsonOut));
+            return;
+        }
+        if (ArgValue(args, "--replay-stacks") is string replayFile)
+        {
+            // Bench check of the report on stored stacks: [{"id": "...", "stacks": [["\\Driver\\x", ...], ...]}, ...].
+            // Files are looked up on THIS PC, so a driver that is not installed here comes out could-not-tell.
+            var outRows = new List<Dictionary<string, object?>>();
+            foreach (var row in JsonSerializer.Deserialize<List<JsonElement>>(File.ReadAllText(replayFile))!)
+            {
+                var nodes = row.GetProperty("stacks").EnumerateArray().Select((st, i) => new Dictionary<string, object?>
+                {
+                    ["where"] = i == 0 ? "pad" : "below pad",
+                    ["instanceId"] = $"stored node {i}",
+                    ["stack"] = st.EnumerateArray().Select(x => x.GetString()!).ToList(),
+                }).ToList();
+                var report = DriverIdentity.PathReport(nodes);
+                outRows.Add(new Dictionary<string, object?>
+                {
+                    ["id"] = row.GetProperty("id").GetString(),
+                    ["status"] = report["status"],
+                    ["summary"] = report["summary"],
+                    ["notMicrosoft"] = report["notMicrosoft"],
+                    ["couldNotTell"] = report["couldNotTell"],
+                    ["microsoft"] = report["microsoft"],
+                    ["padFiltersInStack"] = DriverIdentity.OldFilterField(report),
+                });
+            }
+            Console.WriteLine(JsonSerializer.Serialize(outRows, JsonOut));
             return;
         }
         Headless = args.Contains("--headless");
@@ -268,6 +317,7 @@ class Program
         Console.WriteLine("    your contact (nickname / email, if you gave them)");
         Console.WriteLine("    system info (Windows version, USB + power settings)");
         Console.WriteLine("    which USB port/hub the controller is on, and the names of the other USB devices");
+        Console.WriteLine("    the drivers on the controller's USB path: their names, who made and signed them");
         Console.WriteLine("    PC load during the recording (CPU, memory, top 5 programs by CPU)");
         Console.WriteLine("    the controller's chip ID, and a random ID for this PC made by DeepLog");
         Console.WriteLine();
@@ -979,10 +1029,23 @@ class Program
         snap["mhDevices"] = DetectMHDevices()
             .Select(d => $"{d.VidPid} {d.Name}{(d.Verified ? "" : " (unverified)")}").ToList();
 
-        // ...and which of them sit in the pad's own device stack right now.
+        // ...and every driver on the pad's own USB path that is not proved Microsoft's.
         if (usb != null)
         {
-            try { snap["padFiltersInStack"] = UsbProbe.ThirdPartyInStack(usb); } catch { }
+            try
+            {
+                var report = UsbProbe.DriverReport(usb);
+                snap["padDriverPath"] = report;
+                if (DriverIdentity.OldFilterField(report) is List<string> filters) snap["padFiltersInStack"] = filters;
+            }
+            catch (Exception ex)
+            {
+                snap["padDriverPath"] = new Dictionary<string, object?>
+                {
+                    ["status"] = "error",
+                    ["summary"] = $"The driver check failed, so nothing is known about the drivers on the controller's path: {ex.Message}",
+                };
+            }
             snap["usb"] = usb;
         }
         return snap;
