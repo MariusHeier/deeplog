@@ -27,6 +27,10 @@
 // it is, from the file's signature (DriverIdentity.cs). padFiltersInStack keeps
 // its shape but is no longer a fixed list of names: it is everything in the pad's
 // stack not proved Microsoft's, and is left out when no list could be made.
+// Also snapshot.usbDrivers (the same for every USB device and controller on the
+// PC), windowsFit on each Windows driver (is it this Windows' own copy),
+// snapshot.windowsVersion (update level) and snapshot.windowsChanges (signs of a
+// modified Windows) -- WindowsInfo.cs.
 
 using System;
 using System.Collections.Generic;
@@ -315,9 +319,11 @@ class Program
         Console.WriteLine($"    {recordSeconds:0} second controller recording   ({zipMb:F1} MB)");
         Console.WriteLine("    your note");
         Console.WriteLine("    your contact (nickname / email, if you gave them)");
-        Console.WriteLine("    system info (Windows version, USB + power settings)");
+        Console.WriteLine("    system info (Windows version and update level, USB + power settings)");
+        Console.WriteLine("    signs of a modified Windows (removed or disabled Windows parts, update settings,");
+        Console.WriteLine("      the PC maker name Windows records)");
         Console.WriteLine("    which USB port/hub the controller is on, and the names of the other USB devices");
-        Console.WriteLine("    the drivers on the controller's USB path: their names, who made and signed them");
+        Console.WriteLine("    every driver on your USB devices and controllers: names, versions, who made and signed them");
         Console.WriteLine("    PC load during the recording (CPU, memory, top 5 programs by CPU)");
         Console.WriteLine("    the controller's chip ID, and a random ID for this PC made by DeepLog");
         Console.WriteLine();
@@ -1029,7 +1035,12 @@ class Program
         snap["mhDevices"] = DetectMHDevices()
             .Select(d => $"{d.VidPid} {d.Name}{(d.Verified ? "" : " (unverified)")}").ToList();
 
-        // ...and every driver on the pad's own USB path that is not proved Microsoft's.
+        // v2.2: the Windows update level, and signs of a modified Windows (WindowsInfo.cs).
+        snap["windowsVersion"] = Guarded("Reading the Windows version", WindowsInfo.Version);
+        snap["windowsChanges"] = Guarded("The check for a modified Windows", WindowsInfo.Changes);
+
+        // ...and every driver on the pad's own USB path that is not proved Microsoft's (asked first, so it
+        // gets the signature-check budget first)...
         if (usb != null)
         {
             try
@@ -1043,12 +1054,33 @@ class Program
                 snap["padDriverPath"] = new Dictionary<string, object?>
                 {
                     ["status"] = "error",
-                    ["summary"] = $"The driver check failed, so nothing is known about the drivers on the controller's path: {ex.Message}",
+                    ["summary"] = $"The driver check failed, so nothing is known about the drivers on the controller's path: {WindowsInfo.Scrub(ex.Message)}",
                 };
             }
             snap["usb"] = usb;
         }
+
+        // ...and every driver on every USB device and controller on the PC, Microsoft's included.
+        snap["usbDrivers"] = Guarded("The check of the drivers on the USB tree", () =>
+        {
+            var (nodes, truncated) = UsbProbe.AllUsbNodes();
+            return DriverIdentity.PcReport(nodes, truncated);
+        });
         return snap;
+    }
+
+    /// A new read never takes the bundle down with it: a failure becomes a stated error field.
+    static Dictionary<string, object?> Guarded(string what, Func<Dictionary<string, object?>> read)
+    {
+        try { return read(); }
+        catch (Exception ex)
+        {
+            return new Dictionary<string, object?>
+            {
+                ["status"] = "error",
+                ["summary"] = $"{what} failed, so nothing is known from it: {WindowsInfo.Scrub(ex.Message)}",
+            };
+        }
     }
 
     static string ParseActivePowerPlan()

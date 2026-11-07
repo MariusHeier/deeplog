@@ -40,6 +40,17 @@ something is wrong: two recordings to compare beats one.
   its USB port), with who made and signed each one, so that non-Microsoft
   drivers can be told from Windows' own. Being on this list only means the
   driver was loaded there, not that it causes a problem
+- The same for every other USB device and USB controller on the PC,
+  Microsoft's drivers included, and for each Windows driver whether its
+  version belongs to the Windows it runs on (a light Windows build can carry
+  drivers from an older one). Where a driver was seen is told by device type
+  and USB ID only, never by device name
+- The Windows version down to its update level, and when the last cumulative
+  update was installed
+- Signs of a modified Windows (Tiny11, AtlasOS, ReviOS, Ghost Spectre and the
+  like): the maker name Windows records, update policies and pauses, Windows
+  services that are missing or disabled, setup bypass values, tweak-tool
+  records. Each is a fact, not a verdict
 - PC load during the recording (CPU per core, DPC/interrupt time, memory,
   top 5 programs by CPU), sampled 4x per second on the same clock as the
   controller data
@@ -55,7 +66,10 @@ USB device serial numbers are masked. The PC ID is random (kept in
 hardware or Windows ID. A driver file outside the Windows folder is sent as its
 file name only, and your Windows username and PC name are removed from what is
 reported about each driver. The driver check reads files already on your PC and
-uses no network.
+uses no network. A portable device (a phone, camera or player) is listed by its
+driver's description, not the name its owner gave it, and the USB-wide driver
+list names no device at all. The registered owner of Windows is never sent; it
+is only compared with the names of known modified Windows builds.
 
 Not sent: your Windows username, files, keystrokes, browsing, or anything
 you typed outside the tool. The review screen lists the full contents
@@ -90,6 +104,36 @@ live stack of each device on the path:
 uses for its own files, on a chain Windows says ends at a Microsoft root. The
 "Microsoft Windows Hardware Compatibility Publisher" signature does not count,
 because it also signs other companies' drivers.
+
+Each driver that is (or says it is) Microsoft's also has `windowsFit`:
+`fileVersion` (the binary version, shown as 10.0.x), `windowsFilesVersion`
+(the kernel's), `windowsUpdateRevision` (UBR), `componentStore` (the WinSxS
+component the file is linked to, recorded only: Windows copies some of its own
+drivers instead of linking them), and `result`: `matches-windows`,
+`other-windows-build` (its build is not the build of this Windows' files),
+`newer-than-windows` (revision above the UBR), `not-compared` (versioned apart
+from Windows) or `could-not-tell`. `versionNotThisWindows` lists the first two
+kinds. Not fitting is a fact, not a fault.
+
+`snapshot.usbDrivers` is the same report for every device under every USB host
+controller (controllers, hubs, USB devices, their interfaces and up to three
+levels of what Windows made below them). Per driver, `seenOn` gives `devices`,
+`roles`, `classes`, `vidPids` (up to 12) and `onPadPath`; there are no device
+names or instance IDs. `devicesWithNoDriverList` separates devices Windows has
+not started (a problem code, nothing loaded) from running ones with no list (a
+gap, which makes the status `incomplete`).
+
+`snapshot.windowsVersion`: `productName`, `editionId`, `displayVersion`,
+`build`, `ubr`, `version` ("26200.7840"), `buildLabEx`, `windowsFilesVersion`,
+`cumulativeUpdates` (CBS RollupFix packages with state and install time) and
+`latestInstalledCumulativeUpdate`. The old `snapshot.windows` string is
+unchanged.
+
+`snapshot.windowsChanges`: `checks` (every check with `seen`, `not-seen` or
+`could-not-check`), `signs`, `knownNames`, `oemInformation`,
+`appliedPlaybooks`, `missingParts`, `disabledParts`, `updatePolicies`,
+`setupBypass`, `status` and `summary`. A sign is something a modified Windows or
+a tweak tool commonly leaves; one alone proves nothing.
 
 `padFiltersInStack` keeps its v2.1 shape and scope (the pad and what hangs off
 it), but from v2.2 it holds everything there not proved Microsoft's, instead of

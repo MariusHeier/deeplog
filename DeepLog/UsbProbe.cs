@@ -53,7 +53,7 @@ static class UsbProbe
                 ["path"] = n.Path,
                 ["vidPid"] = DevNode.VidPid(n.Id),
                 ["interface"] = Regex.Match(n.Id, @"&MI_([0-9A-Fa-f]{2})") is { Success: true } m ? m.Groups[1].Value : null,
-                ["name"] = DevNode.Name(n.Dev),
+                ["name"] = SentName(n.Dev),
                 ["product"] = DevNode.Str(n.Dev, DevNode.BusReportedDeviceDesc),
                 ["class"] = DevNode.Str(n.Dev, DevNode.Class),
                 ["service"] = DevNode.Str(n.Dev, DevNode.Service),
@@ -162,29 +162,38 @@ static class UsbProbe
             ["chainPadToRootHub"] = chain,
             ["sameHub"] = nodes.Where(n => n != pad && !n.Path.StartsWith(padPath + "/") &&
                               n.Path.StartsWith(hubPrefix + "/") && n.Path.Count(ch => ch == '/') == padPath.Count(ch => ch == '/'))
-                          .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {DevNode.Name(n.Dev)}").ToList(),
+                          .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {SentName(n.Dev)}").ToList(),
             ["sameController"] = nodes.Where(n => n != pad && n.Path.StartsWith(ctrlPrefix) &&
                               !n.Path.StartsWith(padPath + "/") && !IsChildFunction(n.Id))
-                          .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {DevNode.Name(n.Dev)}").ToList(),
+                          .Select(n => $"{n.Path} {DevNode.VidPid(n.Id)} {SentName(n.Dev)}").ToList(),
             ["deviceStack"] = StackTree(pad.Dev, 3),
             ["driverPath"] = DriverPathNodes(pad.Dev, 3),
         };
     }
+
+    /// Unmasked instance IDs of every devnode on the pad's path from the last Collect (never serialized).
+    static readonly HashSet<string> PadPathIds = new(StringComparer.OrdinalIgnoreCase);
 
     /// Every devnode the pad's data passes through, each with its live stack: the pad and what hangs off it,
     /// then the hubs, the root hub and the host controller. DriverIdentity decides whose each driver is.
     public static List<Dictionary<string, object?>> DriverPathNodes(uint pad, int depth)
     {
         var list = new List<Dictionary<string, object?>>();
-        void Add(uint d, string where) => list.Add(new Dictionary<string, object?>
+        PadPathIds.Clear();
+        void Add(uint d, string where)
         {
-            ["where"] = where,
-            ["instanceId"] = MaskSerial(DevNode.Id(d)),
-            ["service"] = DevNode.Str(d, DevNode.Service),
-            ["stack"] = DevNode.StrList(d, DevNode.Stack),
-            ["driverProvider"] = DevNode.Str(d, DevNode.DriverProvider),
-            ["driverInf"] = DevNode.Str(d, DevNode.DriverInfPath),
-        });
+            string id = DevNode.Id(d);
+            PadPathIds.Add(id);
+            list.Add(new Dictionary<string, object?>
+            {
+                ["where"] = where,
+                ["instanceId"] = MaskSerial(id),
+                ["service"] = DevNode.Str(d, DevNode.Service),
+                ["stack"] = DevNode.StrList(d, DevNode.Stack),
+                ["driverProvider"] = DevNode.Str(d, DevNode.DriverProvider),
+                ["driverInf"] = DevNode.Str(d, DevNode.DriverInfPath),
+            });
+        }
         void Down(uint d, int left)
         {
             if (left == 0) return;
@@ -201,6 +210,56 @@ static class UsbProbe
         return list;
     }
 
+    /// Every devnode under every USB host controller, with its live stack, for snapshot.usbDrivers: the
+    /// controllers, root hubs, hubs, USB devices and their interfaces, and up to three levels of what Windows
+    /// made below a USB device (HID, XInput, keyboard, audio, Bluetooth...). Internal: DriverIdentity.PcReport
+    /// sends only roles, classes and VID:PIDs from here, never a name or an instance ID.
+    public static (List<Dictionary<string, object?>> Nodes, bool Truncated) AllUsbNodes(int maxNodes = 1500)
+    {
+        var list = new List<Dictionary<string, object?>>();
+        var seen = new HashSet<uint>();
+        bool truncated = false;
+        void Add(uint d, string where, string? vidPid)
+        {
+            string id = DevNode.Id(d);
+            list.Add(new Dictionary<string, object?>
+            {
+                ["where"] = where,
+                ["class"] = DevNode.Str(d, DevNode.Class),
+                ["vidPid"] = DevNode.VidPid(id) ?? vidPid,
+                ["problem"] = (int?)DevNode.Status(d)?.Problem,
+                ["onPadPath"] = PadPathIds.Contains(id),
+                ["stack"] = DevNode.StrList(d, DevNode.Stack),
+                ["driverProvider"] = DevNode.Str(d, DevNode.DriverProvider),
+                ["driverInf"] = DevNode.Str(d, DevNode.DriverInfPath),
+            });
+        }
+        void Rec(uint d, string? usbVidPid, int belowUsb)
+        {
+            if (!seen.Add(d)) return;
+            if (list.Count >= maxNodes) { truncated = true; return; }
+            string id = DevNode.Id(d);
+            bool usb = id.StartsWith(@"USB\", StringComparison.OrdinalIgnoreCase);
+            string where = !usb ? "below a USB device"
+                : id.StartsWith(@"USB\ROOT_HUB", StringComparison.OrdinalIgnoreCase) ? "root hub"
+                : (DevNode.Str(d, DevNode.Service) ?? "").StartsWith("USBHUB", StringComparison.OrdinalIgnoreCase) ? "hub"
+                : IsChildFunction(id) ? "USB interface" : "USB device";
+            if (usb) { usbVidPid = DevNode.VidPid(id) ?? usbVidPid; belowUsb = 0; }
+            Add(d, where, usbVidPid);
+            if (!usb && belowUsb >= 3) return;
+            foreach (uint c in DevNode.Children(d)) Rec(c, usbVidPid, usb ? 1 : belowUsb + 1);
+        }
+        foreach (var rh in DevNode.PresentUsb().Where(id => id.StartsWith(@"USB\ROOT_HUB", StringComparison.OrdinalIgnoreCase)))
+        {
+            uint rhDev = DevNode.Locate(rh);
+            if (rhDev == 0) continue;
+            uint ctrl = DevNode.Parent(rhDev);
+            if (ctrl != 0 && seen.Add(ctrl) && list.Count < maxNodes) Add(ctrl, "host controller", null);
+            Rec(rhDev, null, 0);
+        }
+        return (list, truncated);
+    }
+
     // ---- power: D-state + per-device selective-suspend flags -------------------
 
     static readonly Regex PowerValue = new("Suspend|Idle|PowerManagement|D3|WaitWake|RemoteWake", RegexOptions.IgnoreCase);
@@ -208,7 +267,7 @@ static class UsbProbe
     static Dictionary<string, object?> PowerInfo(uint dev, string id, uint? port) => new()
     {
         ["instanceId"] = MaskSerial(id),
-        ["name"] = DevNode.Name(dev),
+        ["name"] = SentName(dev),
         ["port"] = port,
         ["dState"] = DevNode.DState(dev),
         ["deviceParameters"] = DevNode.DeviceParameters(dev, n => PowerValue.IsMatch(n)),
@@ -436,6 +495,16 @@ static class UsbProbe
     }
 
     // ---- helpers -----------------------------------------------------------------
+
+    /// A USB device's name as sent. A portable device (phone, camera, player: class WPD) shows the name its
+    /// owner gave it ("Alex's Galaxy"), so its driver's description is sent instead; in every name the
+    /// Windows username and PC name are masked.
+    static string SentName(uint d)
+    {
+        bool portable = string.Equals(DevNode.Str(d, DevNode.Class), "WPD", StringComparison.OrdinalIgnoreCase);
+        string name = portable ? DevNode.Str(d, DevNode.DeviceDesc) ?? "portable device" : DevNode.Name(d);
+        return WindowsInfo.Scrub(name) ?? "";
+    }
 
     /// "USB\VID_0781&PID_5581\0401A6..." -> "USB\VID_0781&PID_5581\<serial>". Windows-made
     /// instance suffixes contain '&' ("6&35fba998&0&3") and are kept.

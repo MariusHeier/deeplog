@@ -21,7 +21,7 @@ using Microsoft.Win32.SafeHandles;
 static class DriverIdentity
 {
     public const string IsMicrosoft = "microsoft", NotMicrosoft = "not-microsoft", CouldNotTell = "could-not-tell";
-    const int CheckBudgetMs = 15000;
+    const int CheckBudgetMs = 20000;
 
     public class Signature
     {
@@ -134,6 +134,11 @@ static class DriverIdentity
             if (problems.Count > 0 && verdict == CouldNotTell) why += " The check also hit: " + string.Join("; ", problems) + ".";
             res["verdict"] = verdict;
             res["why"] = why;
+
+            // A Windows driver can be Microsoft's and still not belong to this Windows (a light Windows build
+            // carrying drivers from an older one, or a file swapped by hand). Only facts, compared with Windows' own.
+            if (verdict == IsMicrosoft || (company ?? "").Contains("Microsoft", StringComparison.OrdinalIgnoreCase))
+                res["windowsFit"] = WindowsInfo.DriverFitsWindows(path, fv);
         }
         catch (Exception ex) { return Fail(res, $"The check failed: {Scrub(ex.Message)}"); }
         return res;
@@ -156,13 +161,7 @@ static class DriverIdentity
             : @"<outside the Windows folder>\" + Scrub(Path.GetFileName(path));
     }
 
-    static string? Scrub(string? s)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        foreach (var (who, mask) in new[] { (Environment.UserName, "<user>"), (Environment.MachineName, "<pc>") })
-            if (who.Length >= 3) s = Regex.Replace(s, Regex.Escape(who), mask, RegexOptions.IgnoreCase);
-        return s.Trim();
-    }
+    static string? Scrub(string? s) => WindowsInfo.Scrub(s);
 
     // ---- the whole path ---------------------------------------------------------
 
@@ -220,30 +219,130 @@ static class DriverIdentity
         res["notMicrosoft"] = foreign;
         res["couldNotTell"] = unsure;
         res["microsoft"] = Named(IsMicrosoft);
+        res["versionNotThisWindows"] = NotThisWindows(drivers);
         res["otherDriverPackages"] = packages;
         res["nodesWithNoStack"] = noStack;
-        res["summary"] = Summary(drivers, foreign, unsure, packages, noStack);
+        res["summary"] = Summary("on the controller's USB path", drivers, foreign, unsure,
+            packages.Select(p => $"{p["provider"] ?? "no provider named"} ({p["inf"]}, on {p["where"]})").ToList(),
+            noStack.Count == 0 ? null : $"Windows gave no driver list for {noStack.Count} device(s) on the path, so their drivers are unknown.");
         res["drivers"] = drivers;
         return res;
     }
 
-    static string Summary(List<Dictionary<string, object?>> drivers, List<string> foreign, List<string> unsure,
-        List<Dictionary<string, object?>> packages, List<string> noStack)
+    static string Short(string d) => d[(d.LastIndexOf('\\') + 1)..];
+
+    /// Drivers proved (or claiming to be) Microsoft's whose file does not fit this Windows. A fact, not a fault.
+    static List<string> NotThisWindows(List<Dictionary<string, object?>> drivers) => drivers
+        .Where(d => WindowsInfo.OutOfPlace(d.GetValueOrDefault("windowsFit")))
+        .Select(d => (string)d["driver"]!).ToList();
+
+    static string Summary(string scope, List<Dictionary<string, object?>> drivers, List<string> foreign, List<string> unsure,
+        List<string> packages, string? gap)
     {
-        static string Short(string d) => d[(d.LastIndexOf('\\') + 1)..];
         var parts = new List<string>();
         if (foreign.Count > 0)
-            parts.Add($"Not Microsoft's, on the controller's USB path: {string.Join(", ", foreign.Select(Short))}.");
+            parts.Add($"Not Microsoft's, {scope}: {string.Join(", ", foreign.Select(Short))}.");
         if (unsure.Count > 0)
             parts.Add($"Could not tell whether Microsoft's: {string.Join(", ", unsure.Select(Short))}. See why on each.");
+        var odd = drivers.Where(d => WindowsInfo.OutOfPlace(d.GetValueOrDefault("windowsFit"))).ToList();
+        if (odd.Count > 0)
+            parts.Add("Windows drivers whose version does not fit this Windows: " + string.Join("; ", odd.Select(d =>
+                $"{Short((string)d["driver"]!)} {((Dictionary<string, object?>)d["windowsFit"]!)["fileVersion"]} ({((Dictionary<string, object?>)d["windowsFit"]!)["result"]})")) +
+                ". See windowsFit on each.");
+        var unchecked_ = drivers.Where(d => d.GetValueOrDefault("windowsFit") is Dictionary<string, object?> f && f.GetValueOrDefault("result") is "could-not-tell")
+                                .Select(d => Short((string)d["driver"]!)).ToList();
         if (packages.Count > 0)
-            parts.Add("Driver packages not from Windows' own set: " +
-                string.Join(", ", packages.Select(p => $"{p["provider"] ?? "no provider named"} ({p["inf"]}, on {p["where"]})")) + ".");
-        if (noStack.Count > 0)
-            parts.Add($"Windows gave no driver list for {noStack.Count} device(s) on the path, so their drivers are unknown.");
+            parts.Add("Driver packages not from Windows' own set: " + string.Join(", ", packages) + ".");
+        if (gap != null) parts.Add(gap);
         if (parts.Count == 0)
-            return $"All {drivers.Count} drivers on the controller's USB path are proved Microsoft's by their signatures.";
+            return $"All {drivers.Count} drivers {scope} are proved Microsoft's by their signatures, and no Windows driver's version is from another Windows build or newer than this Windows" +
+                   (unchecked_.Count > 0 ? $" (the version of {string.Join(", ", unchecked_)} could not be compared)." : ".");
+        if (unchecked_.Count > 0) parts.Add($"The version of {string.Join(", ", unchecked_)} could not be compared with Windows'.");
         return string.Join(" ", parts);
+    }
+
+    /// What goes in snapshot.usbDrivers: every driver on every USB device and controller on the PC, identified
+    /// the same way as the pad's path. nodes are UsbProbe.AllUsbNodes. Where each driver was seen is told by
+    /// role, device class and VID:PID only: device names can carry a person's name, instance IDs a serial.
+    public static Dictionary<string, object?> PcReport(List<Dictionary<string, object?>> nodes, bool truncated)
+    {
+        var res = new Dictionary<string, object?>
+        {
+            ["method"] = "Every device under every USB host controller (the controllers, hubs, USB devices and the functions Windows " +
+                         "made for them), and the live driver stack of each. Each driver is identified as in padDriverPath. " +
+                         "Device names and instance IDs are not recorded here.",
+            ["note"] = "On this list means Windows had the driver loaded on a USB device or controller when DeepLog looked. It does not say the driver causes a problem.",
+        };
+        var seen = new Dictionary<string, (int Devices, HashSet<string> Roles, HashSet<string> Classes, HashSet<string> VidPids, bool OnPad)>(StringComparer.OrdinalIgnoreCase);
+        var order = new List<string>();
+        var noStack = new List<Dictionary<string, object?>>();
+        var packages = new Dictionary<string, (string? Provider, string Inf, int Devices, HashSet<string> Classes)>(StringComparer.OrdinalIgnoreCase);
+        foreach (var n in nodes)
+        {
+            string role = n["where"]?.ToString() ?? "?";
+            string cls = n.GetValueOrDefault("class") as string ?? "(no class)";
+            string? vp = n.GetValueOrDefault("vidPid") as string;
+            bool onPad = n.GetValueOrDefault("onPadPath") is true;
+            var stack = n["stack"] as List<string> ?? new();
+            if (stack.Count == 0)
+                noStack.Add(new() { ["where"] = role, ["class"] = cls, ["vidPid"] = vp, ["problem"] = n.GetValueOrDefault("problem") });
+            foreach (var entry in stack)
+            {
+                if (!seen.TryGetValue(entry, out var s)) { s = (0, new(), new(), new(), false); order.Add(entry); }
+                s.Roles.Add(role); s.Classes.Add(cls);
+                if (vp != null && s.VidPids.Count < 12) s.VidPids.Add(vp);
+                seen[entry] = (s.Devices + 1, s.Roles, s.Classes, s.VidPids, s.OnPad || onPad);
+            }
+            if (n.GetValueOrDefault("driverInf") is string inf &&
+                (inf.StartsWith("oem", StringComparison.OrdinalIgnoreCase) ||
+                 !string.Equals(n.GetValueOrDefault("driverProvider") as string, "Microsoft", StringComparison.OrdinalIgnoreCase)))
+            {
+                if (!packages.TryGetValue(inf, out var p)) p = (Scrub(n.GetValueOrDefault("driverProvider") as string), inf, 0, new HashSet<string>());
+                p.Classes.Add(cls);
+                packages[inf] = (p.Provider, p.Inf, p.Devices + 1, p.Classes);
+            }
+        }
+
+        var drivers = IdentifyAll(order);
+        foreach (var d in drivers)
+        {
+            var s = seen[(string)d["driver"]!];
+            d["seenOn"] = new Dictionary<string, object?>
+            {
+                ["devices"] = s.Devices, ["roles"] = s.Roles.ToList(), ["classes"] = s.Classes.ToList(),
+                ["vidPids"] = s.VidPids.ToList(), ["onPadPath"] = s.OnPad,
+            };
+        }
+        List<string> Named(string verdict) => drivers.Where(d => (string?)d["verdict"] == verdict).Select(d => (string)d["driver"]!).ToList();
+        var foreign = Named(NotMicrosoft);
+        var unsure = Named(CouldNotTell);
+        // A device Windows has not started (a problem code) has no stack: nothing is loaded on it, which is
+        // known. A started device with no stack is a gap.
+        int unknownStacks = noStack.Count(x => x["problem"] is 0 or null);
+
+        res["status"] = unsure.Count == 0 && unknownStacks == 0 && !truncated ? "complete" : "incomplete";
+        res["devicesChecked"] = nodes.Count;
+        res["notMicrosoft"] = foreign;
+        res["couldNotTell"] = unsure;
+        res["microsoft"] = Named(IsMicrosoft);
+        res["versionNotThisWindows"] = NotThisWindows(drivers);
+        res["otherDriverPackages"] = packages.Values.Select(p => new Dictionary<string, object?>
+        {
+            ["provider"] = p.Provider, ["inf"] = p.Inf, ["devices"] = p.Devices, ["classes"] = p.Classes.ToList(),
+        }).ToList();
+        res["devicesWithNoDriverList"] = noStack;
+        var gaps = new List<string>();
+        if (noStack.Count > unknownStacks)
+            gaps.Add($"{noStack.Count - unknownStacks} device(s) Windows has not started (a problem code), so no driver is loaded on them.");
+        if (unknownStacks > 0)
+            gaps.Add($"Windows gave no driver list for {unknownStacks} running device(s), so their drivers are unknown.");
+        if (truncated)
+            gaps.Add($"The list stopped after {nodes.Count} devices, so devices past that are not covered.");
+        res["summary"] = $"{nodes.Count} devices on the USB tree, {drivers.Count} different drivers. " + Summary("on a USB device or controller", drivers, foreign, unsure,
+            packages.Values.Select(p => $"{p.Provider ?? "no provider named"} ({p.Inf}, {p.Devices} device(s): {string.Join("/", p.Classes)})").ToList(),
+            gaps.Count == 0 ? null : string.Join(" ", gaps));
+        res["drivers"] = drivers;
+        return res;
     }
 
     /// padFiltersInStack, same shape as v2.1 (strings like "\Driver\HidHide"), same scope (the pad and what
@@ -259,18 +358,32 @@ static class DriverIdentity
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
-    // Bounded, so a stuck Cryptographic Services can't hold up the owner: whatever has not
-    // finished at the deadline is reported as not known.
+    // Bounded, so a stuck Cryptographic Services can't hold up the owner: whatever has not finished at the
+    // deadline is reported as not known. One budget for the whole run, shared by the pad's path (asked first)
+    // and the whole USB tree, and a driver checked once is not checked again.
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<string, Dictionary<string, object?>> Checked =
+        new(StringComparer.OrdinalIgnoreCase);
+    static readonly System.Diagnostics.Stopwatch Waited = new();
+
     public static List<Dictionary<string, object?>> IdentifyAll(List<string> entries)
     {
-        var done = new System.Collections.Concurrent.ConcurrentDictionary<string, Dictionary<string, object?>>();
-        var work = Task.Run(() => { foreach (var e in entries) done[e] = Identify(e); });
-        work.Wait(CheckBudgetMs);
-        return entries.Select(e => done.TryGetValue(e, out var r) ? r : new Dictionary<string, object?>
+        var todo = entries.Where(e => !Checked.ContainsKey(e)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        int left = CheckBudgetMs - (int)Waited.ElapsedMilliseconds;
+        if (todo.Count > 0 && left > 0)
         {
-            ["driver"] = e, ["verdict"] = CouldNotTell,
-            ["why"] = $"The signature check did not finish within {CheckBudgetMs / 1000} s.",
-        }).ToList();
+            Waited.Start();
+            try { Task.Run(() => { foreach (var e in todo) Checked.TryAdd(e, Identify(e)); }).Wait(left); }
+            catch (AggregateException) { }
+            finally { Waited.Stop(); }
+        }
+        // Copies: each report adds its own seenOn.
+        return entries.Select(e => Checked.TryGetValue(e, out var r)
+            ? new Dictionary<string, object?>(r) { ["driver"] = e }
+            : new Dictionary<string, object?>
+            {
+                ["driver"] = e, ["verdict"] = CouldNotTell,
+                ["why"] = $"The signature check did not finish within {CheckBudgetMs / 1000} s.",
+            }).ToList();
     }
 
     // ---- signatures -------------------------------------------------------------
