@@ -429,7 +429,7 @@ partial class Program
             else if (connected.Any(x => (long)x["packetChanges"]! > 0))
             {
                 state = "reading";
-                v.Add("Windows is reading the controller: its XInput data changed while you moved the stick.");
+                v.Add("Windows is reading the controller: its XInput data changed while you moved or pressed.");
             }
             else
             {

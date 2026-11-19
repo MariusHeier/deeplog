@@ -38,6 +38,8 @@ static class PadSettings
     const byte OpAppInfo = 0x02, OpTrigClick = 0x15, OpReportCount = 0xB2;
     /// Time between the two report-count reads. The check widens it to span the moment the person moves.
     public static int CountGapMs = 1000;
+    /// Bench pads on test ids (39AE:F0xx) run a synthetic image that serves the count whatever version it reports.
+    static bool TestPad;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr sec,
@@ -66,6 +68,7 @@ static class PadSettings
     public static Dictionary<string, object?> Read(string vidPid, string? hidPath, string? padInstanceId)
     {
         var res = new Dictionary<string, object?> { ["readAtQpc"] = System.Diagnostics.Stopwatch.GetTimestamp() };
+        TestPad = vidPid.StartsWith("39AE:F0", StringComparison.OrdinalIgnoreCase);
         var sw = System.Diagnostics.Stopwatch.StartNew();
         var t = new Thread(() =>
         {
@@ -148,7 +151,7 @@ static class PadSettings
         // Pure no-payload reads on every Seidr from 0.6 (firmware owner, 2026-11-19).
         foreach (var (op, opName) in Seidr09Reads) Do(op, opName);
 
-        if (ver.Success && (major > 0 || minor >= 9))
+        if (TestPad || (ver.Success && (major > 0 || minor >= 9)))
         {
             // The pad's own count of reports the PC took (u16, wraps every 8 s at 8 kHz, restarts
             // at a USB re-setup). Read twice about a second apart and timed with this PC's clock.
