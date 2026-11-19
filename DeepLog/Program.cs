@@ -47,7 +47,7 @@ using Microsoft.Win32.SafeHandles;
 
 partial class Program
 {
-    const string VERSION = "2.3.1";
+    const string VERSION = "2.3.2";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -163,8 +163,9 @@ partial class Program
         double recordSeconds = double.TryParse(ArgValue(args, "--seconds"), System.Globalization.NumberStyles.Float,
             System.Globalization.CultureInfo.InvariantCulture, out double sArg) && sArg > 0 && (sArg <= 120 || longMode) ? sArg : RecordSeconds;
         var benchMarks = (ArgValue(args, "--mark-at") ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
-            .Select(x => double.TryParse(x, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : -1)
-            .Where(v => v >= 0).ToList();
+            .Select(x => (Kind: x.EndsWith("L", StringComparison.OrdinalIgnoreCase) ? "lost" : "late", Text: x.TrimEnd('L', 'l')))
+            .Select(x => (AtS: double.TryParse(x.Text, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : -1, x.Kind))
+            .Where(m => m.AtS >= 0).ToList();          // 12 = an F9 mark at 12 s, 20L = an F8 "lost" mark at 20 s
 
         Console.WriteLine();
         Console.WriteLine("  D E E P L O G   v" + VERSION);
@@ -224,12 +225,13 @@ partial class Program
         {
             Console.WriteLine("  When recording starts, go and play as you normally do.");
             Console.WriteLine();
-            Console.WriteLine("    F9   press it right after the problem happens. You hear a beep.");
+            Console.WriteLine("    F9   press it right after something felt late or wrong. You hear a beep.");
+            Console.WriteLine("    F8   press it when the game lost your controller. A lower beep.");
             Console.WriteLine("    F10  stop recording.");
             Console.WriteLine();
             Console.WriteLine("  You can leave this window in the background. There is no time limit.");
-            Console.WriteLine("  Marius gets the 45 seconds before and 15 seconds after each F9,");
-            Console.WriteLine("  so press F9 every time it happens. Without any F9 he gets the last 5 minutes.");
+            Console.WriteLine("  Marius gets the 45 seconds before and 15 seconds after each press,");
+            Console.WriteLine("  so press every time it happens. Without any press he gets the last 5 minutes.");
             Console.WriteLine();
             if (!ps4)
             {
@@ -237,7 +239,7 @@ partial class Program
                 Console.WriteLine("  catches every sample.");
                 Console.WriteLine();
             }
-            Console.WriteLine("  (Windows tells DeepLog about F9 and F10 only. No other key is read.)");
+            Console.WriteLine("  (Windows tells DeepLog about F8, F9 and F10 only. No other key is read.)");
         }
         else
         {
@@ -247,6 +249,7 @@ partial class Program
         }
         Console.WriteLine();
         string powerPlanBefore = ParseActivePowerPlan();
+        var programsAtStart = ProgramsNow("start", 0);
         var load = new LoadSampler();
         Console.Write("  Starting in ");
         for (int i = (int)CountdownSeconds; i >= 1; i--)
@@ -265,7 +268,7 @@ partial class Program
         {
             if (longMode)
             {
-                lcap = RecordLong(ps4, xinputSlot, workDir, Headless ? recordSeconds : 0, benchMarks);
+                lcap = RecordLong(ps4, xinputSlot, vidPid, workDir, Headless ? recordSeconds : 0, benchMarks);
                 cap = new CaptureResult
                 {
                     Proto = lcap.Proto, RecordSize = lcap.RecordSize, AchievedHz = lcap.AchievedHz,
@@ -290,6 +293,13 @@ partial class Program
         // UID after the recording, so the capture itself is never disturbed.
         var uid = PadUid.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, PadInstanceId(usb));
 
+        // The settings once more, now that the recording is over: a setting that changed, or a
+        // pad counter that restarted, shows something happened to the pad in between.
+        var padSettingsEnd = PadSettings.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, PadInstanceId(usb));
+        padSettingsEnd["readSecondsAfterFirstSample"] =
+            Math.Round(((long)padSettingsEnd["readAtQpc"]! - cap.T0Ticks) / (double)Stopwatch.Frequency, 3);
+        padSettingsEnd.Remove("readAtQpc");
+
         Console.WriteLine();
         Console.WriteLine();
         Console.WriteLine("  Recording complete.");
@@ -307,6 +317,9 @@ partial class Program
 
         // ---- note + contact ----------------------------------------------------
         string note, nickname, email;
+        string? whatHappened = null;
+        string MarkList() => string.Join(", ", lcap!.Marks().Select(m =>
+            $"{Clock(m.T / 1e6)} ({(m.Kind == "lost" ? "F8, lost controller" : "F9")})"));
         if (Headless)
         {
             note = ArgValue(args, "--note") ?? "(headless test capture)";
@@ -318,10 +331,20 @@ partial class Program
             if (lcap != null)
             {
                 // Long session: ask what happened, in their own words, while it is fresh.
-                Console.WriteLine("  What happened? Write it in your own words (ENTER to skip).");
                 if (lcap.MarksUs.Count > 0)
-                    Console.WriteLine("  You pressed F9 at " +
-                        string.Join(", ", lcap.MarksUs.OrderBy(m => m).Select(m => Clock(m / 1e6))) + ".");
+                    Console.WriteLine("  You pressed: " + MarkList() + ".");
+                Console.WriteLine("  What happened?");
+                Console.WriteLine("    [1] A slide, jump or button came late");
+                Console.WriteLine("    [2] The stick felt off");
+                Console.WriteLine("    [3] The game lost my controller");
+                Console.WriteLine("    [ENTER] something else, or nothing");
+                Console.Write("  > ");
+                whatHappened = (Console.ReadLine() ?? "").Trim() switch
+                {
+                    "1" => "input came late", "2" => "stick felt off", "3" => "game lost the controller", _ => null,
+                };
+                Console.WriteLine();
+                Console.WriteLine("  Now in your own words (ENTER to skip).");
                 Console.WriteLine("    example:  aim slid to the left by itself after I let go of the stick");
                 Console.WriteLine("    example:  second F9 was the bad one, the first was a mistake");
             }
@@ -333,6 +356,7 @@ partial class Program
             }
             Console.Write("  > ");
             note = (Console.ReadLine() ?? "").Trim();
+            if (whatHappened != null) note = note.Length == 0 ? whatHappened : $"{whatHappened}: {note}";
             if (note.Length == 0) note = "(no note)";
 
             Console.Write("  Your nickname (Discord/name, ENTER for anonymous): ");
@@ -371,6 +395,9 @@ partial class Program
             ["recordSeconds"] = recordSeconds,
             ["samples"] = lcap?.Count ?? cap.Count,
             ["padSettings"] = padSettings,
+            ["padSettingsEnd"] = padSettingsEnd,
+            ["programs"] = lcap?.Programs.OrderBy(p => (double)p["atS"]!).ToList()
+                           ?? new List<Dictionary<string, object?>> { programsAtStart },
             ["achievedHz"] = Math.Round(cap.AchievedHz, 1),
             ["events"] = cap.Events,
             ["headless"] = Headless ? true : null,
@@ -405,7 +432,7 @@ partial class Program
                 for (int i = 0; i < parts.Count; i++)
                 {
                     string fileName = i == 0 ? "data.mhc" : $"data_{i + 1}.mhc";
-                    long n = WritePart(lcap, parts[i], Path.Combine(workDir, fileName));
+                    var (n, gaps) = WritePart(lcap, parts[i], Path.Combine(workDir, fileName));
                     if (i > 0) entries.Add(fileName);
                     rows.Add(new()
                     {
@@ -413,7 +440,8 @@ partial class Program
                         ["startS"] = Math.Round(parts[i].StartUs / 1e6, 3),
                         ["endS"] = Math.Round(parts[i].EndUs / 1e6, 3),
                         ["samples"] = n,
-                        ["marksS"] = parts[i].MarksUs.Select(m => Math.Round(m / 1e6, 3)).ToList(),
+                        ["marksS"] = parts[i].Marks.Select(m => Math.Round(m.T / 1e6, 3)).ToList(),
+                        ["gaps"] = gaps,
                     });
                 }
                 meta["session"] = new Dictionary<string, object?>
@@ -422,8 +450,15 @@ partial class Program
                     ["durationSeconds"] = Math.Round(lcap.DurationUs / 1e6, 3),
                     ["stopReason"] = lcap.StopReason,
                     ["marksS"] = lcap.MarksUs.OrderBy(m => m).Select(m => Math.Round(m / 1e6, 3)).ToList(),
+                    ["marks"] = lcap.Marks().Select(m => new Dictionary<string, object?>
+                    {
+                        ["tS"] = Math.Round(m.T / 1e6, 3), ["kind"] = m.Kind,
+                        ["key"] = m.Kind == "lost" ? "F8" : "F9",
+                        ["meaning"] = m.Kind == "lost" ? "the game lost my controller" : "that felt late or wrong",
+                    }).ToList(),
+                    ["whatHappened"] = whatHappened,
                     ["sent"] = sentWhat,
-                    ["sentRule"] = sentWhat == "marks" ? $"{MarkBeforeSec:0} s before to {MarkAfterSec:0} s after each mark, overlapping ones joined"
+                    ["sentRule"] = sentWhat == "marks" ? $"{MarkBeforeSec:0} s ({LostBeforeSec:0} s for an F8 mark) before to {MarkAfterSec:0} s after each mark, overlapping ones joined"
                                  : sentWhat == "tail" ? $"no marks: the last {NoMarkTailSec:0} s" : "the whole session",
                     ["fullRecordingBytes"] = new FileInfo(lcap.RawPath).Length,
                     ["timeNote"] = "t_us in each part counts from that part's startS; startS, endS and marksS count from the start of the session",
@@ -462,6 +497,8 @@ partial class Program
         Console.WriteLine("    which USB port/hub the controller is on, and the names of the other USB devices");
         Console.WriteLine("    every driver on your USB devices and controllers: names, versions, who made and signed them");
         Console.WriteLine("    PC load during the recording (CPU, memory, top 5 programs by CPU)");
+        Console.WriteLine("    which launchers, overlays, controller tools and browsers were running, and the");
+        Console.WriteLine("      name of the program in front, at the start and at each mark (names only)");
         Console.WriteLine("    the controller's chip ID, and a random ID for this PC made by DeepLog");
         Console.WriteLine();
         Console.WriteLine("  Nothing else is included.");

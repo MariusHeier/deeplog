@@ -29,7 +29,13 @@ static class PadSettings
         (0x06, "GET_PERSONA"), (0x91, "GET_BINTERVAL"), (0x9F, "GET_UPDATE_ON"),
         (0x55, "READ_FULL_REMAP"), (0x51, "READ_BUTTON_REMAP"),
     };
-    const byte OpAppInfo = 0x02, OpTrigClick = 0x15;
+    // Seidr 0.9 and later only (v2.3.2). Below 0.9 none of these is sent, and 0xB2 never is:
+    // older pads park their report stream on it.
+    static readonly (byte Op, string Name)[] Seidr09Reads =
+    {
+        (0x96, "GET_DIRTY_STATUS"), (0xA8, "GET_LUT_PROVENANCE"), (0x9B, "GET_ADC_TIMING"),
+    };
+    const byte OpAppInfo = 0x02, OpTrigClick = 0x15, OpReportCount = 0xB2;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr sec,
@@ -53,7 +59,7 @@ static class PadSettings
     const uint GENERIC_RW = 0x80000000 | 0x40000000, OPEN_EXISTING = 3;
 
     /// Exchange one opcode; returns (status, 62 data bytes) or null when nothing came back.
-    delegate (byte Status, byte[] Data)? Exchange(byte opcode);
+    delegate (byte Status, byte[] Data)? Exchange(byte opcode, byte[] payload);
 
     public static Dictionary<string, object?> Read(string vidPid, string? hidPath, string? padInstanceId)
     {
@@ -83,13 +89,14 @@ static class PadSettings
         var commands = new List<Dictionary<string, object?>>();
         lock (res) res["commands"] = commands;
 
-        (byte Status, byte[] Data)? Do(byte op, string name)
+        (byte Status, byte[] Data)? Do(byte op, string name, params byte[] payload)
         {
-            var r = x(op);
+            var r = x(op, payload);
             var row = new Dictionary<string, object?>
             {
                 ["opcode"] = $"0x{op:X2}",
                 ["name"] = name,
+                ["payloadHex"] = payload.Length == 0 ? null : Convert.ToHexString(payload),
                 ["status"] = r == null ? null : $"0x{r.Value.Status:X2}",
                 ["dataHex"] = r == null ? null : Convert.ToHexString(r.Value.Data),
             };
@@ -135,6 +142,15 @@ static class PadSettings
         // Click triggers: the command exists from Seidr 0.7. Older Seidr is not asked.
         if (ver.Success && (major > 0 || minor >= 7)) Do(OpTrigClick, "GET_TRIG_CLICK");
         else lock (res) res["trigClickSkipped"] = "only asked on Seidr 0.7 and later";
+
+        if (ver.Success && (major > 0 || minor >= 9))
+        {
+            foreach (var (op, opName) in Seidr09Reads) Do(op, opName);
+            // The pad's own count of reports the PC took. The payload is exactly 0xFF, nothing else, ever.
+            // Kept raw only (commands[].dataHex): the firmware owner decodes it.
+            Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
+        }
+        else lock (res) res["seidr09ReadsSkipped"] = "only asked on Seidr 0.9 and later";
     }
 
     // ---- PS4 mode: HID feature reports ---------------------------------------------
@@ -154,12 +170,13 @@ static class PadSettings
             len = Math.Max(BitConverter.ToUInt16(caps, 8), (ushort)64);
         }
 
-        RunReads(op =>
+        RunReads((op, payload) =>
         {
             for (int attempt = 0; attempt < 2; attempt++)
             {
                 var send = new byte[len];
-                send[0] = 0x90; send[1] = op;                    // rest stays zero: no payload, ever
+                send[0] = 0x90; send[1] = op;                    // rest stays zero
+                payload.CopyTo(send, 2);
                 if (!HidD_SetFeature(h, send, len)) return null;
                 Thread.Sleep(30);
                 var recv = new byte[len];
@@ -216,10 +233,13 @@ static class PadSettings
             EscapeCommFunction(h, 5);                                 // SETDTR
             PurgeComm(h, 0x0008 | 0x0004);
 
-            RunReads(op =>
+            RunReads((op, payload) =>
             {
                 PurgeComm(h, 0x0008);
-                if (!WriteFile(h, new byte[] { 0x7E, op }, 2, out uint w, IntPtr.Zero) || w != 2) return null;
+                var frame = new byte[2 + payload.Length];
+                frame[0] = 0x7E; frame[1] = op;
+                payload.CopyTo(frame, 2);
+                if (!WriteFile(h, frame, (uint)frame.Length, out uint w, IntPtr.Zero) || w != frame.Length) return null;
                 var reply = new byte[64];
                 int got = 0;
                 var one = new byte[64];
