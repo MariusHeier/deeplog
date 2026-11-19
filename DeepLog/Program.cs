@@ -47,7 +47,7 @@ using Microsoft.Win32.SafeHandles;
 
 partial class Program
 {
-    const string VERSION = "2.4.0";
+    const string VERSION = "2.4.1";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -79,6 +79,7 @@ partial class Program
     // --headless: no prompts, for bench testing. Records a real capture from the
     // pad that is plugged in; never uploads unless --upload is given too.
     static bool Headless;
+    static string? HeadlessDevice;
 
     // Relaxed escaping keeps '&' in instance IDs readable; the JSON is equivalent.
     static readonly JsonSerializerOptions JsonOut = new()
@@ -157,6 +158,7 @@ partial class Program
             return;
         }
         Headless = args.Contains("--headless");
+        HeadlessDevice = ArgValue(args, "--device")?.ToUpperInvariant();
         // --long (bench): the "while I play" session; --seconds then says when it stops by itself,
         // and --mark-at 5,12.5 drops marks at those seconds.
         bool longMode = args.Contains("--long");
@@ -653,6 +655,7 @@ partial class Program
         while (true)
         {
             var gaming = DetectMHDevices().Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid)).ToList();
+            if (HeadlessDevice != null) gaming = gaming.Where(d => d.VidPid == HeadlessDevice).ToList();   // --device 39AE:F00A
             if (gaming.Count > 0)
             {
                 Console.WriteLine($"  Found: {gaming[0].Name}");

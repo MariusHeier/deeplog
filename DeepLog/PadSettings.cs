@@ -36,6 +36,8 @@ static class PadSettings
         (0x96, "GET_DIRTY_STATUS"), (0xA8, "GET_LUT_PROVENANCE"), (0x9B, "GET_ADC_TIMING"),
     };
     const byte OpAppInfo = 0x02, OpTrigClick = 0x15, OpReportCount = 0xB2;
+    /// Time between the two report-count reads. The check widens it to span the moment the person moves.
+    public static int CountGapMs = 1000;
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr sec,
@@ -76,7 +78,7 @@ static class PadSettings
             catch (Exception ex) { lock (res) res["error"] = ex.Message; }
         }) { IsBackground = true };
         t.Start();
-        if (!t.Join(4000)) lock (res) res["error"] = "timed out after 4 s";
+        if (!t.Join(3000 + CountGapMs)) lock (res) res["error"] = "timed out";
         lock (res)
         {
             res["ms"] = Math.Round(sw.Elapsed.TotalMilliseconds, 1);
@@ -154,9 +156,11 @@ static class PadSettings
             // The payload is exactly 0xFF, nothing else, ever, and never below Seidr 0.9.
             var a = Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
             long qa = System.Diagnostics.Stopwatch.GetTimestamp();
-            Thread.Sleep(1000);
+            var ua = DateTime.UtcNow;
+            Thread.Sleep(CountGapMs);
             var b = Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
             long qb = System.Diagnostics.Stopwatch.GetTimestamp();
+            var ub = DateTime.UtcNow;
             if (a != null && b != null && a.Value.Status == 0xAA && b.Value.Status == 0xAA)
             {
                 int ca = BitConverter.ToUInt16(a.Value.Data, 6), cb = BitConverter.ToUInt16(b.Value.Data, 6);
@@ -164,6 +168,9 @@ static class PadSettings
                 lock (res) res["reportCount"] = new Dictionary<string, object?>
                 {
                     ["first"] = ca, ["second"] = cb, ["secondsBetween"] = Math.Round(dt, 4),
+                    ["firstReadUtc"] = ua.ToString("o"), ["secondReadUtc"] = ub.ToString("o"),
+                    ["byte0First"] = (int)a.Value.Data[0], ["byte0Second"] = (int)b.Value.Data[0],   // 0 = not paused
+                    ["advanced"] = ((cb - ca) & 0xFFFF) != 0,
                     ["reportsPerSecondByPadCount"] = Math.Round(((cb - ca) & 0xFFFF) / dt, 0),
                     ["note"] = "the pad's own count of reports the PC took; in XInput the pad sends only on change, so a pad at rest counts nothing",
                 };

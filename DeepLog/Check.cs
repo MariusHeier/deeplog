@@ -63,6 +63,19 @@ partial class Program
             });
             if (depth < 3) foreach (uint c in DevNode.Children(d)) Add(c, depth + 1);
         }
+        uint parent = DevNode.Parent(pad);                  // the hub or root hub the pad hangs on
+        if (parent != 0)
+        {
+            var st = DevNode.Status(parent);
+            rows.Add(new()
+            {
+                ["depth"] = -1, ["interface"] = null, ["instanceId"] = UsbProbe.MaskSerial(DevNode.Id(parent)), ["name"] = DevNode.Name(parent),
+                ["service"] = DevNode.Str(parent, DevNode.Service),
+                ["started"] = st == null ? null : (st.Value.Status & 0x8) != 0,
+                ["hasProblem"] = st == null ? null : (st.Value.Status & 0x400) != 0,
+                ["problemCode"] = st?.Problem, ["dState"] = DevNode.DState(parent),
+            });
+        }
         Add(pad, 0);
         return rows;
     }
@@ -308,35 +321,68 @@ partial class Program
 
     // ---- the check ---------------------------------------------------------------------
 
-    static (Dictionary<string, object?> Data, List<string> Verdict) RunCheck(string vidPid, bool ps4, Dictionary<string, object?> usb)
+    static (Dictionary<string, object?> Data, List<string> Verdict) RunCheck(string vidPid, bool ps4, Dictionary<string, object?> usb, bool? movedArg)
     {
         var data = new Dictionary<string, object?> { ["startedUtc"] = DateTime.UtcNow.ToString("o") };
         string? padId = PadInstanceId(usb);
         var tree = DeviceTree(padId);
         data["deviceTree"] = tree;
 
-        Console.WriteLine();
-        Console.WriteLine("  Move a stick in circles NOW and keep going until it says stop.");
-        Console.Write("  Looking");
-        Dictionary<string, object?>? pad = null;
-        var padThread = new Thread(() => { pad = PadSettings.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, padId); })
-        { IsBackground = true };
         var programs = ProgramsNow("check", 0);
-
+        Dictionary<string, object?>? pad = null;
         List<Dictionary<string, object?>> xin = new();
         Dictionary<string, object?>? hid = null;
-        Thread.Sleep(700);                                  // let the hand get going
-        padThread.Start();
-        if (ps4) hid = HidLook(CheckWindowSec);
-        else
+        var looks = new List<Dictionary<string, object?>>();
+        bool? moved = movedArg;                             // did the person really move or press? null = not known
+
+        bool XChanged() => xin.Any(x => (string)x["dll"]! == "xinput1_4" && x["connected"] is true && (long)x["packetChanges"]! > 0);
+        bool XConnected() => xin.Any(x => (string)x["dll"]! == "xinput1_4" && x["connected"] is true);
+
+        for (int attempt = 1; attempt <= 2; attempt++)
         {
-            xin.AddRange(XInputLook("xinput1_4", XInput14, CheckWindowSec)); Console.Write(".");
-            xin.AddRange(XInputLook("xinput1_3", XInput13, 0.6)); Console.Write(".");
-            xin.AddRange(XInputLook("xinput9_1_0", XInput910, 0.6)); Console.Write(".");
+            Console.WriteLine();
+            Console.WriteLine("  Move a stick in circles AND keep tapping a button, NOW, until it says stop.");
+            Console.Write("  Looking");
+            pad = null; xin = new(); hid = null;
+            // The pad's own count is read twice, 2.5 s apart, inside the same seconds the person moves.
+            PadSettings.CountGapMs = 2500;
+            Dictionary<string, object?>? padNow = null;
+            var padThread = new Thread(() => { padNow = PadSettings.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, padId); })
+            { IsBackground = true };
+            Thread.Sleep(700);                              // let the hand get going
+            padThread.Start();
+            if (ps4) hid = HidLook(CheckWindowSec);
+            else
+            {
+                xin.AddRange(XInputLook("xinput1_4", XInput14, CheckWindowSec)); Console.Write(".");
+                xin.AddRange(XInputLook("xinput1_3", XInput13, 0.6)); Console.Write(".");
+                xin.AddRange(XInputLook("xinput9_1_0", XInput910, 0.6)); Console.Write(".");
+            }
+            padThread.Join(7000);
+            PadSettings.CountGapMs = 1000;
+            pad = padNow;
+            pad?.Remove("readAtQpc");
+            Console.WriteLine("  stop. Thank you.");
+
+            // Only a silent XInput pad needs the person's word: a healthy pad at rest is silent too.
+            bool silentXInput = !ps4 && XConnected() && !XChanged();
+            if (silentXInput && !Headless)
+            {
+                Console.WriteLine();
+                Console.Write("  Did you move a stick or tap a button while it was looking? [y/n] ");
+                string a = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+                moved = a.StartsWith("y") ? true : a.StartsWith("n") ? false : null;
+            }
+            looks.Add(new()
+            {
+                ["attempt"] = attempt, ["personSaidMoved"] = moved,
+                ["xinputChanged"] = ps4 ? null : XChanged(),
+                ["padReportCount"] = pad?.GetValueOrDefault("reportCount"),
+            });
+            if (!(silentXInput && moved == false && !Headless)) break;
+            if (attempt == 1) Console.WriteLine("  Then once more, and this time keep moving and tapping.");
         }
-        padThread.Join(5000);
-        Console.WriteLine("  stop. Thank you.");
-        pad?.Remove("readAtQpc");
+        data["looks"] = looks;
         data["xinput"] = ps4 ? null : xin;
         data["hid"] = hid;
         data["padSettings"] = pad;
@@ -349,17 +395,16 @@ partial class Program
 
         // ---- verdict, in plain words ----------------------------------------------------
         var v = new List<string>();
-        var top = tree.FirstOrDefault();
-        var problems = tree.Where(n => n["hasProblem"] is true || (n["problemCode"] is uint pc && pc != 0)).ToList();
+        var top = tree.FirstOrDefault(n => (int)n["depth"]! == 0);
+        var problems = tree.Where(n => (int)n["depth"]! >= 0).Where(n => n["hasProblem"] is true || (n["problemCode"] is uint pc && pc != 0)).ToList();
         string? fw = pad?.GetValueOrDefault("firmwareName") as string;
         var count = pad?.GetValueOrDefault("reportCount") as Dictionary<string, object?>;
-        double? padRate = count?["reportsPerSecondByPadCount"] is double r ? r : null;
         string? padSkipped = pad?.GetValueOrDefault("skipped") as string;
 
         if (top == null) v.Add("Windows does not list the controller on USB right now.");
         foreach (var p in problems)
             v.Add($"Windows reports a problem (code {p["problemCode"]}) on \"{p["name"]}\"" +
-                  (p["interface"] != null ? $", interface {p["interface"]}." : "."));
+                  (p.GetValueOrDefault("interface") != null ? $", interface {p.GetValueOrDefault("interface")}." : "."));
 
         string state;
         if (ps4)
@@ -373,7 +418,7 @@ partial class Program
         {
             var main = xin.Where(x => (string)x["dll"]! == "xinput1_4" && x["installed"] is true).ToList();
             var connected = main.Where(x => x["connected"] is true).ToList();
-            var gamepadIf = tree.FirstOrDefault(n => n["interface"] is int i && i == 0);
+            var gamepadIf = tree.FirstOrDefault(n => n.GetValueOrDefault("interface") is int i && i == 0);
             if (connected.Count == 0)
             {
                 state = "no-slot";
@@ -388,11 +433,46 @@ partial class Program
             }
             else
             {
-                state = "never-read";
-                v.Add("The controller has an XInput slot, but nothing arrived from it in 4 seconds.");
-                v.Add("If you were moving the stick, that is the fault. If not, run the check again and move it.");
-                if (padRate is > 0) v.Add($"The controller's own count says the PC took about {padRate:0} reports per second, so they are lost inside Windows.");
-                else if (padRate == 0) v.Add("The controller's own count says the PC took no reports from it.");
+                // Nothing changed in XInput. In XInput a pad sends only when something changes, so a
+                // pad at rest is silent and healthy. A fault is only called when the person says they
+                // moved AND the pad itself can be asked.
+                bool? padAdvanced = count?["advanced"] as bool?;
+                bool paused = count != null && ((count["byte0First"] as int? ?? 0) != 0 || (count["byte0Second"] as int? ?? 0) != 0);
+                var prov = (pad?.GetValueOrDefault("commands") as List<Dictionary<string, object?>>)
+                    ?.FirstOrDefault(c => (string?)c["opcode"] == "0xA8" && (string?)c["status"] == "0xAA")?["dataHex"] as string;
+                bool notCalibrated = prov != null && prov.Length >= 6 && prov.Substring(4, 2) == "00";
+
+                if (moved != true)
+                {
+                    state = "at-rest-or-unknown";
+                    v.Add("Nothing arrived from the controller, but it is not known that anything was moved or pressed.");
+                    v.Add("A controller at rest sends nothing in XInput mode, so this is not a fault by itself. Run the check again and move a stick and tap a button.");
+                }
+                else if (paused)
+                {
+                    state = "pad-paused";
+                    v.Add("The controller says it is paused, which the setup site does while it is open. Close the setup site and run the check again.");
+                }
+                else if (padAdvanced == true)
+                {
+                    state = "sent-not-delivered";
+                    v.Add("The controller is sending and this PC took its reports, but they do not reach XInput. The fault is on the PC side.");
+                }
+                else if (padAdvanced == false)
+                {
+                    state = "never-read";
+                    v.Add("You moved the controller, but the PC took no reports from it: Windows shows it as connected and is not reading it.");
+                    v.Add("Unplug it and plug it in again, then run the check once more to compare.");
+                }
+                else
+                {
+                    state = "no-change-unconfirmed";
+                    v.Add("You moved the controller and nothing arrived, but its side could not be asked" +
+                          (pad?.GetValueOrDefault("reportCountSkipped") != null ? " (its firmware is older than 0.9)." : "."));
+                    v.Add("So this could not be confirmed as a fault.");
+                }
+                if (notCalibrated)
+                    v.Add("The sticks on this controller are not calibrated yet, so moving them sends nothing. Use a button for this check, and calibrate on the setup site.");
             }
             if (connected.Count > 1) v.Add($"Note: {connected.Count} XInput controllers are connected, so DeepLog cannot tell which slot is this one.");
             var other = xin.Where(x => (string)x["dll"]! != "xinput1_4" && x["installed"] is true)
@@ -418,7 +498,9 @@ partial class Program
     {
         Console.WriteLine();
         Console.WriteLine("  Check: this only looks, it changes nothing. It takes under a minute.");
-        var (data, verdict) = RunCheck(vidPid, ps4, usb);
+        // --moved yes|no (bench): what a person would answer to 'did you move or press?'
+        string? movedText = ArgValue(args, "--moved");
+        var (data, verdict) = RunCheck(vidPid, ps4, usb, movedText == null ? null : movedText.StartsWith("y"));
 
         Console.WriteLine();
         Console.WriteLine("  RESULT");
