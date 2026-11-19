@@ -47,7 +47,7 @@ using Microsoft.Win32.SafeHandles;
 
 partial class Program
 {
-    const string VERSION = "2.3.2";
+    const string VERSION = "2.4.0";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -181,31 +181,45 @@ partial class Program
         var (vidPid, name) = device.Value;
 
         bool ps4 = vidPid == Ps4VidPid;
-        int xinputSlot = -1;
-        if (!ps4)
-        {
-            xinputSlot = vidPid == "NONE" ? 0 : ResolveXInputSlot();
-            if (xinputSlot < 0) return;
-        }
 
         // Where the pad sits, while it is surely plugged in. Read-only, a few ms.
         Dictionary<string, object?> usb;
         try { usb = UsbProbe.Collect(vidPid); }
         catch (Exception ex) { usb = new() { ["error"] = ex.Message }; }
 
-        // ---- quick test or a whole play session ------------------------------
+        // ---- quick test, a whole play session, or the check -------------------
+        bool checkMode = args.Contains("--check");
         if (!Headless)
         {
             Console.WriteLine();
-            Console.WriteLine("  What do you want to record?");
-            Console.WriteLine("    [1] Quick test  -- 30 seconds, you move the sticks and click buttons");
+            Console.WriteLine("  What do you want to do?");
+            Console.WriteLine("    [1] Quick test   -- 30 seconds, you move the sticks and click buttons");
             Console.WriteLine("    [2] While I play -- records until you stop it");
+            Console.WriteLine("    [3] Check        -- a game or Windows does not see my controller (1 minute)");
             while (true)
             {
                 Console.Write("  > ");
                 string c = (Console.ReadLine() ?? "").Trim();
                 if (c == "" || c == "1") break;
                 if (c == "2") { longMode = true; break; }
+                if (c == "3") { checkMode = true; break; }
+            }
+        }
+        if (checkMode)
+        {
+            // Before the XInput slot is looked for: a pad with no slot is what the check is for.
+            RunCheckFlow(args, vidPid, name, ps4, usb);
+            return;
+        }
+
+        int xinputSlot = -1;
+        if (!ps4)
+        {
+            xinputSlot = vidPid == "NONE" ? 0 : ResolveXInputSlot();
+            if (xinputSlot < 0)
+            {
+                Console.WriteLine("  Run DeepLog again and pick [3] Check to see why.");
+                return;
             }
         }
 
