@@ -47,7 +47,7 @@ using Microsoft.Win32.SafeHandles;
 
 partial class Program
 {
-    const string VERSION = "2.3.0";
+    const string VERSION = "2.3.1";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -315,9 +315,22 @@ partial class Program
         }
         else
         {
-            Console.WriteLine("  Useful note to Marius");
-            Console.WriteLine("    example:  Log of normal joystick feeling");
-            Console.WriteLine("    example:  Log of joystick feeling weird");
+            if (lcap != null)
+            {
+                // Long session: ask what happened, in their own words, while it is fresh.
+                Console.WriteLine("  What happened? Write it in your own words (ENTER to skip).");
+                if (lcap.MarksUs.Count > 0)
+                    Console.WriteLine("  You pressed F9 at " +
+                        string.Join(", ", lcap.MarksUs.OrderBy(m => m).Select(m => Clock(m / 1e6))) + ".");
+                Console.WriteLine("    example:  aim slid to the left by itself after I let go of the stick");
+                Console.WriteLine("    example:  second F9 was the bad one, the first was a mistake");
+            }
+            else
+            {
+                Console.WriteLine("  Useful note to Marius");
+                Console.WriteLine("    example:  Log of normal joystick feeling");
+                Console.WriteLine("    example:  Log of joystick feeling weird");
+            }
             Console.Write("  > ");
             note = (Console.ReadLine() ?? "").Trim();
             if (note.Length == 0) note = "(no note)";
