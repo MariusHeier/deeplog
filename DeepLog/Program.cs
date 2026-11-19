@@ -45,9 +45,9 @@ using System.Text.Json;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
-class Program
+partial class Program
 {
-    const string VERSION = "2.2.0";
+    const string VERSION = "2.3.0";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -157,14 +157,20 @@ class Program
             return;
         }
         Headless = args.Contains("--headless");
+        // --long (bench): the "while I play" session; --seconds then says when it stops by itself,
+        // and --mark-at 5,12.5 drops marks at those seconds.
+        bool longMode = args.Contains("--long");
         double recordSeconds = double.TryParse(ArgValue(args, "--seconds"), System.Globalization.NumberStyles.Float,
-            System.Globalization.CultureInfo.InvariantCulture, out double sArg) && sArg > 0 && sArg <= 120 ? sArg : RecordSeconds;
+            System.Globalization.CultureInfo.InvariantCulture, out double sArg) && sArg > 0 && (sArg <= 120 || longMode) ? sArg : RecordSeconds;
+        var benchMarks = (ArgValue(args, "--mark-at") ?? "").Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(x => double.TryParse(x, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double v) ? v : -1)
+            .Where(v => v >= 0).ToList();
 
         Console.WriteLine();
         Console.WriteLine("  D E E P L O G   v" + VERSION);
         Console.WriteLine("  Controller recorder for MH gamepads");
         Console.WriteLine();
-        Console.WriteLine("  Record 30 seconds of controller data and send it to Marius.");
+        Console.WriteLine("  Record your controller and send the recording to Marius.");
         Console.WriteLine("  It reads your controller only -- no keyboard, no files, nothing else.");
         Console.WriteLine();
 
@@ -186,11 +192,59 @@ class Program
         try { usb = UsbProbe.Collect(vidPid); }
         catch (Exception ex) { usb = new() { ["error"] = ex.Message }; }
 
+        // ---- quick test or a whole play session ------------------------------
+        if (!Headless)
+        {
+            Console.WriteLine();
+            Console.WriteLine("  What do you want to record?");
+            Console.WriteLine("    [1] Quick test  -- 30 seconds, you move the sticks and click buttons");
+            Console.WriteLine("    [2] While I play -- records until you stop it");
+            while (true)
+            {
+                Console.Write("  > ");
+                string c = (Console.ReadLine() ?? "").Trim();
+                if (c == "" || c == "1") break;
+                if (c == "2") { longMode = true; break; }
+            }
+        }
+
+        string workDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "DeepLog", $"deeplog_{DateTime.Now:yyyy-MM-dd_HHmmss}");
+        Directory.CreateDirectory(workDir);
+
+        // The pad's own settings, before the recording so the capture is never disturbed.
+        var padSettings = PadSettings.Read(vidPid, ps4 ? FindHidPath(0x054C, 0x05C4) : null, PadInstanceId(usb));
+        long settingsQpc = (long)padSettings["readAtQpc"]!;
+        padSettings.Remove("readAtQpc");
+
         // ---- instruction + countdown ----------------------------------------
         Console.WriteLine();
-        Console.WriteLine("  When recording starts:");
-        Console.WriteLine("    Move the joysticks in circles around the edge. Click buttons.");
-        Console.WriteLine("    Whatever is relevant for your case.");
+        if (longMode)
+        {
+            Console.WriteLine("  When recording starts, go and play as you normally do.");
+            Console.WriteLine();
+            Console.WriteLine("    F9   press it right after the problem happens. You hear a beep.");
+            Console.WriteLine("    F10  stop recording.");
+            Console.WriteLine();
+            Console.WriteLine("  You can leave this window in the background. There is no time limit.");
+            Console.WriteLine("  Marius gets the 45 seconds before and 15 seconds after each F9,");
+            Console.WriteLine("  so press F9 every time it happens. Without any F9 he gets the last 5 minutes.");
+            Console.WriteLine();
+            if (!ps4)
+            {
+                Console.WriteLine("  While it records, DeepLog keeps one CPU core busy. That is how it");
+                Console.WriteLine("  catches every sample.");
+                Console.WriteLine();
+            }
+            Console.WriteLine("  (Windows tells DeepLog about F9 and F10 only. No other key is read.)");
+        }
+        else
+        {
+            Console.WriteLine("  When recording starts:");
+            Console.WriteLine("    Move the joysticks in circles around the edge. Click buttons.");
+            Console.WriteLine("    Whatever is relevant for your case.");
+        }
         Console.WriteLine();
         string powerPlanBefore = ParseActivePowerPlan();
         var load = new LoadSampler();
@@ -206,10 +260,22 @@ class Program
 
         // ---- recording -------------------------------------------------------
         CaptureResult cap;
+        LongCapture? lcap = null;
         try
         {
-            cap = ps4 ? HidCapture(0x054C, 0x05C4, recordSeconds)
-                      : XInputCapture(xinputSlot, recordSeconds);
+            if (longMode)
+            {
+                lcap = RecordLong(ps4, xinputSlot, workDir, Headless ? recordSeconds : 0, benchMarks);
+                cap = new CaptureResult
+                {
+                    Proto = lcap.Proto, RecordSize = lcap.RecordSize, AchievedHz = lcap.AchievedHz,
+                    StartUnixUs = lcap.StartUnixUs, T0Ticks = lcap.T0Ticks, Events = lcap.Events,
+                };
+                recordSeconds = lcap.DurationUs / 1e6;
+            }
+            else
+                cap = ps4 ? HidCapture(0x054C, 0x05C4, recordSeconds)
+                          : XInputCapture(xinputSlot, recordSeconds);
         }
         catch (Exception ex)
         {
@@ -227,6 +293,16 @@ class Program
         Console.WriteLine();
         Console.WriteLine();
         Console.WriteLine("  Recording complete.");
+        if (lcap != null)
+        {
+            Console.WriteLine($"    {Clock(recordSeconds)} recorded, {lcap.MarksUs.Count} mark(s). It ended because {lcap.StopReason}.");
+            if (lcap.Count == 0)
+            {
+                Console.WriteLine("  Nothing came from the controller, so there is nothing to send.");
+                try { File.Delete(lcap.RawPath); } catch { }
+                return;
+            }
+        }
         Console.WriteLine();
 
         // ---- note + contact ----------------------------------------------------
@@ -255,13 +331,10 @@ class Program
         }
 
         // ---- bundle ------------------------------------------------------------
-        string workDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "DeepLog", $"deeplog_{DateTime.Now:yyyy-MM-dd_HHmmss}");
-        Directory.CreateDirectory(workDir);
-
         string mhcPath = Path.Combine(workDir, "data.mhc");
-        WriteMhc(mhcPath, cap);
+        if (lcap == null) WriteMhc(mhcPath, cap);
+        padSettings["readSecondsBeforeFirstSample"] =
+            Math.Round((cap.T0Ticks - settingsQpc) / (double)Stopwatch.Frequency, 3);
 
         string installId = InstallId();
         var meta = new Dictionary<string, object?>
@@ -283,7 +356,8 @@ class Program
             },
             ["padUid"] = uid,
             ["recordSeconds"] = recordSeconds,
-            ["samples"] = cap.Count,
+            ["samples"] = lcap?.Count ?? cap.Count,
+            ["padSettings"] = padSettings,
             ["achievedHz"] = Math.Round(cap.AchievedHz, 1),
             ["events"] = cap.Events,
             ["headless"] = Headless ? true : null,
@@ -303,20 +377,70 @@ class Program
         File.WriteAllText(Path.Combine(workDir, "load.json"), JsonSerializer.Serialize(loadJson, JsonCompact));
 
         string zipPath = Path.Combine(workDir, "bundle.zip");
-        using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
+        string sentWhat = lcap == null ? "quick" : lcap.MarksUs.Count > 0 ? "marks" : "tail";
+
+        // Long session: cut the parts to send out of session.raw. The first part is
+        // data.mhc (so every reader of the 30-second test opens it), then data_2.mhc ...
+        void BuildZip()
         {
-            zip.CreateEntryFromFile(mhcPath, "data.mhc", CompressionLevel.Optimal);
+            var entries = new List<string> { "data.mhc" };
+            if (lcap != null)
+            {
+                foreach (var old in Directory.GetFiles(workDir, "data*.mhc")) File.Delete(old);
+                var parts = PlanParts(lcap, sentWhat);
+                var rows = new List<Dictionary<string, object?>>();
+                for (int i = 0; i < parts.Count; i++)
+                {
+                    string fileName = i == 0 ? "data.mhc" : $"data_{i + 1}.mhc";
+                    long n = WritePart(lcap, parts[i], Path.Combine(workDir, fileName));
+                    if (i > 0) entries.Add(fileName);
+                    rows.Add(new()
+                    {
+                        ["file"] = fileName,
+                        ["startS"] = Math.Round(parts[i].StartUs / 1e6, 3),
+                        ["endS"] = Math.Round(parts[i].EndUs / 1e6, 3),
+                        ["samples"] = n,
+                        ["marksS"] = parts[i].MarksUs.Select(m => Math.Round(m / 1e6, 3)).ToList(),
+                    });
+                }
+                meta["session"] = new Dictionary<string, object?>
+                {
+                    ["mode"] = "while-playing",
+                    ["durationSeconds"] = Math.Round(lcap.DurationUs / 1e6, 3),
+                    ["stopReason"] = lcap.StopReason,
+                    ["marksS"] = lcap.MarksUs.OrderBy(m => m).Select(m => Math.Round(m / 1e6, 3)).ToList(),
+                    ["sent"] = sentWhat,
+                    ["sentRule"] = sentWhat == "marks" ? $"{MarkBeforeSec:0} s before to {MarkAfterSec:0} s after each mark, overlapping ones joined"
+                                 : sentWhat == "tail" ? $"no marks: the last {NoMarkTailSec:0} s" : "the whole session",
+                    ["fullRecordingBytes"] = new FileInfo(lcap.RawPath).Length,
+                    ["timeNote"] = "t_us in each part counts from that part's startS; startS, endS and marksS count from the start of the session",
+                    ["parts"] = rows,
+                };
+                File.WriteAllText(Path.Combine(workDir, "meta.json"), JsonSerializer.Serialize(meta, jsonOpts));
+            }
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+            using var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create);
+            foreach (string e in entries)
+                zip.CreateEntryFromFile(Path.Combine(workDir, e), e, CompressionLevel.Optimal);
             zip.CreateEntryFromFile(Path.Combine(workDir, "meta.json"), "meta.json");
             zip.CreateEntryFromFile(Path.Combine(workDir, "note.txt"), "note.txt");
             zip.CreateEntryFromFile(Path.Combine(workDir, "snapshot.json"), "snapshot.json");
             zip.CreateEntryFromFile(Path.Combine(workDir, "load.json"), "load.json", CompressionLevel.Optimal);
         }
+        BuildZip();
         double zipMb = new FileInfo(zipPath).Length / 1024.0 / 1024.0;
+        bool canSendAll = lcap != null && sentWhat != "everything" && new FileInfo(lcap.RawPath).Length <= SendEverythingMaxRaw
+            && lcap.DurationUs > (sentWhat == "tail" ? NoMarkTailSec * 1e6 : 0);
+        string WhatLine() => lcap == null ? $"{recordSeconds:0} second controller recording"
+            : sentWhat == "marks" ? $"{MarkBeforeSec:0} s before to {MarkAfterSec:0} s after each of your {lcap.MarksUs.Count} mark(s), out of {Clock(recordSeconds)} recorded"
+            : sentWhat == "tail" ? $"the last {Clock(Math.Min(NoMarkTailSec, recordSeconds))} of {Clock(recordSeconds)} recorded (no F9 marks)"
+            : $"the whole {Clock(recordSeconds)} recording";
 
         // ---- review + consent ----------------------------------------------------
         Console.WriteLine();
         Console.WriteLine("  Ready to send:");
-        Console.WriteLine($"    {recordSeconds:0} second controller recording   ({zipMb:F1} MB)");
+        Console.WriteLine($"    {WhatLine()}   ({zipMb:F1} MB)");
+        Console.WriteLine("    the controller's own settings (firmware version, mode, rate, button remap, click triggers)");
         Console.WriteLine("    your note");
         Console.WriteLine("    your contact (nickname / email, if you gave them)");
         Console.WriteLine("    system info (Windows version and update level, USB + power settings)");
@@ -342,8 +466,25 @@ class Program
             return;
         }
 
-        Console.Write("  Send to Marius now? [Y/n] ");
+        Console.Write(canSendAll ? "  Send to Marius now? [Y/n]  (a = send the whole recording instead) "
+                                 : "  Send to Marius now? [Y/n] ");
         string yn = (Console.ReadLine() ?? "").Trim().ToLowerInvariant();
+        if (canSendAll && (yn == "a" || yn == "all"))
+        {
+            string before = sentWhat;
+            sentWhat = "everything";
+            Console.WriteLine("  Packing the whole recording...");
+            BuildZip();
+            zipMb = new FileInfo(zipPath).Length / 1024.0 / 1024.0;
+            if (zipMb > 500)
+            {
+                Console.WriteLine($"  The whole recording is {zipMb:F0} MB, over the 500 MB limit. Sending the shorter one.");
+                sentWhat = before;
+                BuildZip();
+            }
+            else Console.WriteLine($"  {WhatLine()}   ({zipMb:F1} MB)");
+            yn = "y";
+        }
 
         if (yn == "" || yn == "y" || yn == "yes")
         {
@@ -359,6 +500,11 @@ class Program
                 Console.WriteLine();
                 Console.WriteLine("  Tip: if the controller starts feeling different later -- better or");
                 Console.WriteLine("  worse -- run DeepLog again. Two recordings to compare beats one.");
+                if (lcap != null)
+                {
+                    try { File.Delete(lcap.RawPath); Console.WriteLine(); Console.WriteLine("  The full recording on this PC has been deleted."); }
+                    catch { }
+                }
             }
             else
             {
