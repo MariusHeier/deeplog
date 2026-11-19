@@ -29,8 +29,8 @@ static class PadSettings
         (0x06, "GET_PERSONA"), (0x91, "GET_BINTERVAL"), (0x9F, "GET_UPDATE_ON"),
         (0x55, "READ_FULL_REMAP"), (0x51, "READ_BUTTON_REMAP"),
     };
-    // Seidr 0.9 and later only (v2.3.2). Below 0.9 none of these is sent, and 0xB2 never is:
-    // older pads park their report stream on it.
+    // v2.3.2: three more no-payload reads, served by every Seidr from 0.6. 0xB2 [0xFF] is
+    // Seidr 0.9 and later ONLY: older pads park their report stream on it.
     static readonly (byte Op, string Name)[] Seidr09Reads =
     {
         (0x96, "GET_DIRTY_STATUS"), (0xA8, "GET_LUT_PROVENANCE"), (0x9B, "GET_ADC_TIMING"),
@@ -143,14 +143,33 @@ static class PadSettings
         if (ver.Success && (major > 0 || minor >= 7)) Do(OpTrigClick, "GET_TRIG_CLICK");
         else lock (res) res["trigClickSkipped"] = "only asked on Seidr 0.7 and later";
 
+        // Pure no-payload reads on every Seidr from 0.6 (firmware owner, 2026-11-19).
+        foreach (var (op, opName) in Seidr09Reads) Do(op, opName);
+
         if (ver.Success && (major > 0 || minor >= 9))
         {
-            foreach (var (op, opName) in Seidr09Reads) Do(op, opName);
-            // The pad's own count of reports the PC took. The payload is exactly 0xFF, nothing else, ever.
-            // Kept raw only (commands[].dataHex): the firmware owner decodes it.
-            Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
+            // The pad's own count of reports the PC took (u16, wraps every 8 s at 8 kHz, restarts
+            // at a USB re-setup). Read twice about a second apart and timed with this PC's clock.
+            // Only the count is decoded: over HID the rest of the reply is cut short by the pad.
+            // The payload is exactly 0xFF, nothing else, ever, and never below Seidr 0.9.
+            var a = Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
+            long qa = System.Diagnostics.Stopwatch.GetTimestamp();
+            Thread.Sleep(1000);
+            var b = Do(OpReportCount, "GET_REPORT_COUNT", 0xFF);
+            long qb = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (a != null && b != null && a.Value.Status == 0xAA && b.Value.Status == 0xAA)
+            {
+                int ca = BitConverter.ToUInt16(a.Value.Data, 6), cb = BitConverter.ToUInt16(b.Value.Data, 6);
+                double dt = (qb - qa) / (double)System.Diagnostics.Stopwatch.Frequency;
+                lock (res) res["reportCount"] = new Dictionary<string, object?>
+                {
+                    ["first"] = ca, ["second"] = cb, ["secondsBetween"] = Math.Round(dt, 4),
+                    ["reportsPerSecondByPadCount"] = Math.Round(((cb - ca) & 0xFFFF) / dt, 0),
+                    ["note"] = "the pad's own count of reports the PC took; in XInput the pad sends only on change, so a pad at rest counts nothing",
+                };
+            }
         }
-        else lock (res) res["seidr09ReadsSkipped"] = "only asked on Seidr 0.9 and later";
+        else lock (res) res["reportCountSkipped"] = "only asked on Seidr 0.9 and later";
     }
 
     // ---- PS4 mode: HID feature reports ---------------------------------------------
