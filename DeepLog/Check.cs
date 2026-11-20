@@ -29,7 +29,7 @@ partial class Program
 
     delegate uint XInputGet(uint i, out XINPUT_STATE s);
     const double CheckWindowSec = 4.0;
-    static readonly string[] PadIdPrefixes = { @"USB\VID_39AE", @"USB\VID_054C&PID_05C4", @"USB\VID_1A86&PID_1235" };
+    static readonly string[] PadIdPrefixes = { @"USB\VID_39AE", @"USB\VID_054C&PID_05C4", @"USB\VID_1A86&PID_1235", @"USB\VID_1209&PID_D035" };
 
     // ---- 1. Windows' view of the device ---------------------------------------------
 
@@ -209,7 +209,8 @@ partial class Program
     static bool MentionsPad(string s) =>
         s.Contains("VID_39AE", StringComparison.OrdinalIgnoreCase) ||
         s.Contains("VID_054C&PID_05C4", StringComparison.OrdinalIgnoreCase) ||
-        s.Contains("VID_1A86&PID_1235", StringComparison.OrdinalIgnoreCase);
+        s.Contains("VID_1A86&PID_1235", StringComparison.OrdinalIgnoreCase) ||
+        s.Contains("VID_1209&PID_D035", StringComparison.OrdinalIgnoreCase);
 
     /// Kernel-PnP events of the last day that name the pad. wevtutil, read-only, no admin for these logs.
     static Dictionary<string, object?> PnpEvents()
@@ -290,7 +291,7 @@ partial class Program
             {
                 static string Show(object? v) => v is byte[] b ? Convert.ToHexString(b) : v?.ToString() ?? "";
                 bool Ours(string n) => n.Contains("39AE", StringComparison.OrdinalIgnoreCase) || n.Contains("054C05C4", StringComparison.OrdinalIgnoreCase)
-                    || n.Contains("1A861235", StringComparison.OrdinalIgnoreCase);
+                    || n.Contains("1A861235", StringComparison.OrdinalIgnoreCase) || n.Contains("1209D035", StringComparison.OrdinalIgnoreCase);
                 foreach (string v in k.GetValueNames().Where(Ours)) flags[v] = Show(k.GetValue(v));
                 foreach (string sub in k.GetSubKeyNames().Where(Ours))
                 {

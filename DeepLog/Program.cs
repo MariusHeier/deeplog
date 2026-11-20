@@ -47,7 +47,7 @@ using Microsoft.Win32.SafeHandles;
 
 partial class Program
 {
-    const string VERSION = "2.4.2";
+    const string VERSION = "2.5.0";
 
     const string UploadUrlEndpoint = "https://tools.mariusheier.com/deeppoll/upload-url";
     const string DiscordUrl = "https://discord.gg/4Q9SRUt85j";
@@ -68,6 +68,7 @@ partial class Program
         ["39AE:4000"] = "MH4 Gamepad (Setup Mode)",
         ["39AE:5000"] = "MH5 Gamepad (Setup Mode)",
         ["1209:0001"] = "WebUSB Setup Device",
+        [BootloaderVidPid] = "Controller in firmware update mode",
     };
 
     static readonly string[] SetupModeVidPids = { "39AE:4000", "39AE:5000", "1209:0001" };
@@ -188,6 +189,13 @@ partial class Program
         Dictionary<string, object?> usb;
         try { usb = UsbProbe.Collect(vidPid); }
         catch (Exception ex) { usb = new() { ["error"] = ex.Message }; }
+
+        if (vidPid == BootloaderVidPid)
+        {
+            // No firmware is running, so there is nothing to record or check: say so, offer a report.
+            RunBootloaderFlow(args, name, usb);
+            return;
+        }
 
         // ---- quick test, a whole play session, or the check -------------------
         bool checkMode = args.Contains("--check");
@@ -597,7 +605,7 @@ partial class Program
         while (true)
         {
             var found = DetectMHDevices();
-            var gaming = found.Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid)).ToList();
+            var gaming = found.Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid) && d.VidPid != BootloaderVidPid).ToList();
             var setup = found.Where(d => SetupModeVidPids.Contains(d.VidPid) && d.Verified).ToList();
             bool anyXInputSlot = ConnectedXInputSlots().Count > 0;
 
@@ -624,6 +632,8 @@ partial class Program
                     }
                 }
             }
+            if (found.Any(d => d.VidPid == BootloaderVidPid))
+                return (BootloaderVidPid, KnownDevices[BootloaderVidPid]);   // before "any XInput pad": that would be another device
             if (setup.Count > 0)
             {
                 Console.WriteLine($"  Your {setup[0].Name.Replace(" (Setup Mode)", "")} is in SETUP MODE.");
@@ -654,13 +664,15 @@ partial class Program
         var deadline = DateTime.UtcNow.AddSeconds(10);
         while (true)
         {
-            var gaming = DetectMHDevices().Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid)).ToList();
+            var gaming = DetectMHDevices().Where(d => d.Verified && !SetupModeVidPids.Contains(d.VidPid) && d.VidPid != BootloaderVidPid).ToList();
             if (HeadlessDevice != null) gaming = gaming.Where(d => d.VidPid == HeadlessDevice).ToList();   // --device 39AE:F00A
             if (gaming.Count > 0)
             {
                 Console.WriteLine($"  Found: {gaming[0].Name}");
                 return (gaming[0].VidPid, gaming[0].Name);
             }
+            if (HeadlessDevice is null or BootloaderVidPid && BootloaderPresent())
+                return (BootloaderVidPid, KnownDevices[BootloaderVidPid]);
             if (ConnectedXInputSlots().Count > 0)
             {
                 Console.WriteLine("  Found: USB controller (XInput)");
@@ -916,7 +928,7 @@ partial class Program
     const uint GENERIC_READ = 0x80000000, FILE_SHARE_RW = 0x03, OPEN_EXISTING = 3;
 
     /// Find the HID interface path for vid:pid whose input reports are readable.
-    static string? FindHidPath(ushort vid, ushort pid)
+    static string? FindHidPath(ushort vid, ushort pid, bool needInput = true)
     {
         HidD_GetHidGuid(out Guid gid);
         IntPtr devs = SetupDiGetClassDevs(ref gid, IntPtr.Zero, IntPtr.Zero,
@@ -948,7 +960,7 @@ partial class Program
                     if (!HidD_GetPreparsedData(h, out IntPtr pp)) continue;
                     HidP_GetCaps(pp, out var caps);
                     HidD_FreePreparsedData(pp);
-                    if (caps.InputReportByteLength > 0) return path;   // readable input collection
+                    if (caps.InputReportByteLength > 0 || !needInput) return path;   // readable input collection
                 }
                 finally { Marshal.FreeHGlobal(detail); }
             }
@@ -1128,7 +1140,7 @@ partial class Program
     // ---- device detection (CfgMgr32; v2.0 used WMI Win32_PnPEntity) ------------
 
     static readonly string[] MhIdPrefixes = { @"USB\VID_39AE", @"USB\VID_054C&PID_05C4",
-        @"USB\VID_1A86&PID_1235", @"USB\VID_1209&PID_0001" };
+        @"USB\VID_1A86&PID_1235", @"USB\VID_1209&PID_0001", @"USB\VID_1209&PID_D035" };
 
     static List<(string VidPid, string Name, bool Verified)> DetectMHDevices()
     {
